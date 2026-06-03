@@ -661,7 +661,7 @@ type Plan struct {
 func (s *Service) ListPlans(ctx context.Context) ([]*Plan, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, description, price, seconds, download_speed, upload_speed, max_sessions
-		FROM authentication_tariffplan
+		FROM services_tariffplan
 		WHERE is_active = 1
 		ORDER BY price ASC
 	`)

@@ -191,7 +191,7 @@ CREATE TABLE IF NOT EXISTS radcheck (
     value VARCHAR(253) NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS authentication_tariffplan (
+CREATE TABLE IF NOT EXISTS services_tariffplan (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     description VARCHAR(255),
     price DECIMAL(10,2) NOT NULL,
@@ -232,7 +232,7 @@ func seedFixtures(db *sql.DB) error {
 
 	// Seed a tariff plan ($5 = 500 cents, price 5.00)
 	_, err = db.Exec(`
-		INSERT INTO authentication_tariffplan (description, price, seconds, download_speed, upload_speed, max_sessions, is_active)
+		INSERT INTO services_tariffplan (description, price, seconds, download_speed, upload_speed, max_sessions, is_active)
 		VALUES ('5 USD Plan', 5.00, 3600, 10, 5, 1, 1)
 	`)
 	if err != nil {

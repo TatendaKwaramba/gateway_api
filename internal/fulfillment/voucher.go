@@ -29,7 +29,7 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 
 	err := s.db.QueryRowContext(ctx, `
 		SELECT seconds, download_speed, upload_speed, max_sessions
-		FROM authentication_tariffplan
+		FROM services_tariffplan
 		WHERE price = ? AND is_active = TRUE
 		LIMIT 1
 	`, amountWhole).Scan(
