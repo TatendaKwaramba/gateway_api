@@ -72,6 +72,7 @@ type initiatePaymentRequest struct {
 	MethodCode       string            `json:"method_code"`
 	Amount           int64             `json:"amount"`
 	Currency         string            `json:"currency"`
+	PlanID           *int64            `json:"plan_id,omitempty"`
 	CustomerEmail    string            `json:"customer_email,omitempty"`
 	CustomerPhone    string            `json:"customer_phone,omitempty"`
 	CustomerID       *int64            `json:"customer_id,omitempty"`
@@ -108,6 +109,7 @@ func (r *Router) initiatePayment(w http.ResponseWriter, req *http.Request) {
 		MethodCode:       reqBody.MethodCode,
 		Amount:           reqBody.Amount,
 		Currency:         reqBody.Currency,
+		PlanID:           reqBody.PlanID,
 		CustomerEmail:    reqBody.CustomerEmail,
 		CustomerPhone:    reqBody.CustomerPhone,
 		CustomerID:       reqBody.CustomerID,

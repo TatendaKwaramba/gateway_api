@@ -30,8 +30,9 @@ func NewService(db *sql.DB, notifier notify.Provider) *Service {
 type FulfillRequest struct {
 	TransactionID    int64
 	TransactionIDStr string
-	Amount           int64  // in cents
+	Amount           int64  // minor currency units
 	Currency         string
+	PlanID           int64
 	CustomerPhone    string
 	CustomerEmail    string
 	FulfillmentKind  string

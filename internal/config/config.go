@@ -24,7 +24,7 @@ type Config struct {
 	AdminHMACSecret string `envconfig:"ADMIN_HMAC_SECRET" required:"true"`
 
 	// Default currency for tariff plans (used when plan has no currency stored)
-	DefaultCurrency string `envconfig:"DEFAULT_CURRENCY" default:"USD"`
+	DefaultCurrency string `envconfig:"DEFAULT_CURRENCY" default:"ZAR"`
 
 	// Gateway configurations
 	MockGatewayEnabled       bool   `envconfig:"MOCK_GATEWAY_ENABLED" default:"false"`

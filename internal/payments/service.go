@@ -55,8 +55,9 @@ func NewService(db *sql.DB, registry *gateways.Registry, fulfillmentService Fulf
 type InitiateRequest struct {
 	GatewayCode      string            `json:"gateway_code"`
 	MethodCode       string            `json:"method_code"`
-	Amount           int64             `json:"amount"` // in cents
+	Amount           int64             `json:"amount"` // minor currency units (cents)
 	Currency         string            `json:"currency"`
+	PlanID           *int64            `json:"plan_id,omitempty"`
 	CustomerEmail    string            `json:"customer_email,omitempty"`
 	CustomerPhone    string            `json:"customer_phone,omitempty"`
 	CustomerID       *int64            `json:"customer_id,omitempty"`
@@ -90,6 +91,16 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 	if req.Currency == "" {
 		return nil, fmt.Errorf("currency is required")
 	}
+
+	if err := s.validateGatewayCurrency(ctx, req.GatewayCode, req.Currency); err != nil {
+		return nil, err
+	}
+
+	if req.PlanID != nil {
+		if err := s.validatePlanAmount(ctx, *req.PlanID, req.Amount, req.Currency); err != nil {
+			return nil, err
+		}
+	}
 	
 	// Resolve gateway
 	gateway, ok := s.registry.Resolve(req.GatewayCode)
@@ -120,14 +131,20 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		fulfillmentKind = "voucher"
 	}
 	
+	var planID interface{}
+	if req.PlanID != nil {
+		planID = *req.PlanID
+	}
+
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO payments_paymenttransaction (
 			transaction_id, gateway_id, payment_method_id, amount, currency,
+			tariff_plan_id,
 			state, status, customer_id, customer_email, customer_phone,
 			idempotency_key, fulfillment_kind, gateway_response, created_at, updated_at
 		)
 		SELECT 
-			?, g.id, pm.id, ?, ?, 
+			?, g.id, pm.id, ?, ?, ?,
 			'initiated', 'initiated', ?, ?, ?,
 			?, ?, JSON_OBJECT(), NOW(), NOW()
 		FROM payments_paymentgateway g
@@ -135,8 +152,9 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		WHERE g.gateway_code = ?
 	`,
 		transactionIDStr,
-		float64(req.Amount)/100.0, // Convert cents to decimal
+		float64(req.Amount)/100.0,
 		req.Currency,
+		planID,
 		req.CustomerID,
 		req.CustomerEmail,
 		req.CustomerPhone,
@@ -535,15 +553,18 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 	// Fetch transaction details needed for fulfillment
 	var amountFloat float64
 	var currency, customerPhone, customerEmail, fulfillmentKind, transactionIDStr string
+	var planID sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
 			t.transaction_id, t.amount, t.currency,
-			t.customer_phone, t.customer_email, t.fulfillment_kind
+			t.customer_phone, t.customer_email, t.fulfillment_kind,
+			t.tariff_plan_id
 		FROM payments_paymenttransaction t
 		WHERE t.id = ?
 	`, transactionID).Scan(
 		&transactionIDStr, &amountFloat, &currency,
 		&customerPhone, &customerEmail, &fulfillmentKind,
+		&planID,
 	)
 	if err != nil {
 		slog.Error("fulfillment: failed to query transaction details",
@@ -555,7 +576,7 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 
 	amountCents := int64(amountFloat * 100)
 
-	result, err := s.fulfillmentService.Fulfill(ctx, fulfillment.FulfillRequest{
+	fr := fulfillment.FulfillRequest{
 		TransactionID:    transactionID,
 		TransactionIDStr: transactionIDStr,
 		Amount:           amountCents,
@@ -563,7 +584,11 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 		CustomerPhone:    customerPhone,
 		CustomerEmail:    customerEmail,
 		FulfillmentKind:  fulfillmentKind,
-	})
+	}
+	if planID.Valid {
+		fr.PlanID = planID.Int64
+	}
+	result, err := s.fulfillmentService.Fulfill(ctx, fr)
 	if err != nil {
 		slog.Error("fulfillment failed",
 			slog.Int64("transaction_id", transactionID),
@@ -647,22 +672,72 @@ func (s *Service) PollStatus(ctx context.Context, transactionID int64) (*GetStat
 
 // Plan represents a tariff plan from the catalog
 type Plan struct {
-	ID            int64   `json:"id"`
-	Name          string  `json:"name"`
-	Price         float64 `json:"price"`
-	Currency      string  `json:"currency"`
-	DurationSeconds int64 `json:"duration_seconds"`
-	DownloadSpeed int64   `json:"download_speed"`
-	UploadSpeed   int64   `json:"upload_speed"`
-	MaxSessions   int64   `json:"max_sessions"`
+	ID                 int64   `json:"id"`
+	Name               string  `json:"name"`
+	Price              int64   `json:"price"` // minor currency units (500 = R5.00)
+	DisplayAmount      float64 `json:"display_amount"`
+	Currency           string  `json:"currency"`
+	DurationSeconds    int64   `json:"duration_seconds"`
+	DurationDays       int64   `json:"duration_days"`
+	DownloadSpeed      int64   `json:"download_speed"`
+	UploadSpeed        int64   `json:"upload_speed"`
+	MaxSessions        int64   `json:"max_sessions"`
+	FupDataQuotaMb     int64   `json:"fup_data_quota_mb"`
+	FupDownloadSpeed   int64   `json:"fup_download_speed"`
+	FupUploadSpeed     int64   `json:"fup_upload_speed"`
+	MarketingTagline   string  `json:"marketing_tagline,omitempty"`
+}
+
+func (s *Service) validateGatewayCurrency(ctx context.Context, gatewayCode, currency string) error {
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM payments_gatewaysupportedcurrency gsc
+		JOIN payments_paymentgateway pg ON pg.id = gsc.gateway_id
+		JOIN services_supportedcurrency sc ON sc.id = gsc.currency_id
+		WHERE pg.gateway_code = ? AND sc.code = ? AND gsc.is_active = 1 AND sc.is_active = 1
+	`, gatewayCode, currency).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("currency validation failed: %w", err)
+	}
+	if count == 0 {
+		return fmt.Errorf("currency %s not supported for gateway %s", currency, gatewayCode)
+	}
+	return nil
+}
+
+func (s *Service) validatePlanAmount(ctx context.Context, planID, amount int64, currency string) error {
+	var price int64
+	var planCurrency string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT price, currency FROM services_tariffplan WHERE id = ? AND is_active = 1
+	`, planID).Scan(&price, &planCurrency)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("plan not found: %d", planID)
+	}
+	if err != nil {
+		return fmt.Errorf("plan lookup failed: %w", err)
+	}
+	if price != amount {
+		return fmt.Errorf("amount %d does not match plan price %d", amount, price)
+	}
+	if planCurrency != "" && currency != planCurrency {
+		return fmt.Errorf("currency %s does not match plan currency %s", currency, planCurrency)
+	}
+	return nil
 }
 
 // ListPlans returns all active tariff plans ordered by price
 func (s *Service) ListPlans(ctx context.Context) ([]*Plan, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, description, price, seconds, download_speed, upload_speed, max_sessions
-		FROM authentication_tariffplan
-		WHERE is_active = 1
+		SELECT id,
+			COALESCE(NULLIF(package_label, ''), description, ''),
+			price, currency, seconds, duration_days,
+			download_speed, upload_speed, max_sessions,
+			fup_data_quota_mb, fup_download_speed, fup_upload_speed,
+			COALESCE(marketing_tagline, '')
+		FROM services_tariffplan
+		WHERE is_active = 1 AND (plan_kind IS NULL OR plan_kind != 'smoke')
 		ORDER BY price ASC
 	`)
 	if err != nil {
@@ -673,22 +748,26 @@ func (s *Service) ListPlans(ctx context.Context) ([]*Plan, error) {
 	var plans []*Plan
 	for rows.Next() {
 		var p Plan
-		var description *string
+		var label string
 		err := rows.Scan(
-			&p.ID, &description, &p.Price, &p.DurationSeconds,
+			&p.ID, &label, &p.Price, &p.Currency, &p.DurationSeconds, &p.DurationDays,
 			&p.DownloadSpeed, &p.UploadSpeed, &p.MaxSessions,
+			&p.FupDataQuotaMb, &p.FupDownloadSpeed, &p.FupUploadSpeed,
+			&p.MarketingTagline,
 		)
 		if err != nil {
 			slog.Warn("failed to scan plan", slog.Any("error", err))
 			continue
 		}
-		// Map description to name (use "Unnamed Plan" if null)
-		if description != nil && *description != "" {
-			p.Name = *description
+		if label != "" {
+			p.Name = label
 		} else {
-			p.Name = fmt.Sprintf("Plan (%d Mbps)", p.DownloadSpeed)
+			p.Name = fmt.Sprintf("Plan %d", p.Price)
 		}
-		p.Currency = s.defaultCurrency
+		if p.Currency == "" {
+			p.Currency = s.defaultCurrency
+		}
+		p.DisplayAmount = float64(p.Price) / 100.0
 		plans = append(plans, &p)
 	}
 

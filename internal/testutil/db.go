@@ -112,7 +112,8 @@ CREATE TABLE IF NOT EXISTS payments_paymenttransaction (
     gateway_id BIGINT NOT NULL,
     payment_method_id BIGINT,
     amount DECIMAL(10,2) NOT NULL,
-    currency VARCHAR(3) DEFAULT 'USD',
+    currency VARCHAR(3) DEFAULT 'ZAR',
+    tariff_plan_id BIGINT,
     state VARCHAR(20) DEFAULT 'initiated',
     status VARCHAR(20) DEFAULT 'initiated',
     customer_id BIGINT,
@@ -191,15 +192,82 @@ CREATE TABLE IF NOT EXISTS radcheck (
     value VARCHAR(253) NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS authentication_tariffplan (
+CREATE TABLE IF NOT EXISTS services_supportedcurrency (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    description VARCHAR(255),
-    price DECIMAL(10,2) NOT NULL,
+    code VARCHAR(3) NOT NULL UNIQUE,
+    name VARCHAR(100) NOT NULL,
+    symbol VARCHAR(8) DEFAULT '',
+    minor_units_per_major INT UNSIGNED DEFAULT 100,
+    decimal_places SMALLINT UNSIGNED DEFAULT 2,
+    is_active TINYINT(1) DEFAULT 1,
+    is_default TINYINT(1) DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS services_hotspotdaypolicy (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(50) DEFAULT 'default',
+    is_active TINYINT(1) DEFAULT 1,
+    currency_id BIGINT NOT NULL,
+    price_minor_anchor INT UNSIGNED DEFAULT 500,
+    seconds_per_day INT UNSIGNED DEFAULT 86400,
+    peak_download_kbps INT UNSIGNED DEFAULT 3000,
+    peak_upload_kbps INT UNSIGNED DEFAULT 1500,
+    fup_mb_per_day INT UNSIGNED DEFAULT 102400,
+    fup_throttle_download_kbps INT UNSIGNED DEFAULT 1000,
+    fup_throttle_upload_kbps INT UNSIGNED DEFAULT 500,
+    max_sessions_base INT UNSIGNED DEFAULT 2,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS services_tariffplan (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    day_policy_id BIGINT,
+    service_tier_id BIGINT,
+    plan_kind VARCHAR(20) DEFAULT 'hotspot_voucher',
+    package_label VARCHAR(50) DEFAULT '',
+    marketing_tagline VARCHAR(120) DEFAULT '',
+    currency VARCHAR(3) DEFAULT 'ZAR',
+    price INT NOT NULL,
+    duration_days INT UNSIGNED DEFAULT 1,
+    seconds_override INT UNSIGNED,
+    time_string VARCHAR(20) NOT NULL,
     seconds INT NOT NULL,
+    max_sessions INT NOT NULL DEFAULT 1,
     download_speed INT NOT NULL,
     upload_speed INT NOT NULL,
-    max_sessions INT NOT NULL DEFAULT 1,
+    download_limit INT,
+    upload_limit INT,
+    fup_data_quota_mb INT UNSIGNED DEFAULT 0,
+    fup_download_speed INT UNSIGNED DEFAULT 1000,
+    fup_upload_speed INT UNSIGNED DEFAULT 500,
+    fup_quota_window VARCHAR(20) DEFAULT 'plan_period',
+    description VARCHAR(100),
     is_active TINYINT(1) DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS payments_gatewaysupportedcurrency (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    gateway_id BIGINT NOT NULL,
+    currency_id BIGINT NOT NULL,
+    is_active TINYINT(1) DEFAULT 1,
+    UNIQUE KEY uq_gateway_currency (gateway_id, currency_id)
+);
+
+CREATE TABLE IF NOT EXISTS vouchers_voucher (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    radcheck_id BIGINT NOT NULL,
+    tariff_plan_id BIGINT,
+    voucher_amount INT DEFAULT 0,
+    voucher_serial_number VARCHAR(64),
+    voucher_pin VARCHAR(64),
+    voucher_expired_date DATETIME,
+    voucher_response_message TEXT,
+    voucher_status TINYINT(1) DEFAULT 1,
+    payment_transaction_id BIGINT,
+    created_by_id INT NOT NULL DEFAULT 1,
+    updated_by_id INT NOT NULL DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 `
 	_, err := db.Exec(schema)
@@ -230,10 +298,36 @@ func seedFixtures(db *sql.DB) error {
 		return fmt.Errorf("insert mock methods: %w", err)
 	}
 
-	// Seed a tariff plan ($5 = 500 cents, price 5.00)
 	_, err = db.Exec(`
-		INSERT INTO authentication_tariffplan (description, price, seconds, download_speed, upload_speed, max_sessions, is_active)
-		VALUES ('5 USD Plan', 5.00, 3600, 10, 5, 1, 1)
+		INSERT INTO services_supportedcurrency (code, name, symbol, is_active, is_default)
+		VALUES ('ZAR', 'South African Rand', 'R', 1, 1)
+	`)
+	if err != nil {
+		return fmt.Errorf("insert currency: %w", err)
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO services_hotspotdaypolicy (name, currency_id, is_active)
+		VALUES ('default', 1, 1)
+	`)
+	if err != nil {
+		return fmt.Errorf("insert day policy: %w", err)
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO payments_gatewaysupportedcurrency (gateway_id, currency_id, is_active)
+		VALUES (1, 1, 1)
+	`)
+	if err != nil {
+		return fmt.Errorf("insert gateway currency: %w", err)
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO services_tariffplan (
+			day_policy_id, package_label, currency, price, duration_days,
+			time_string, seconds, download_speed, upload_speed, max_sessions,
+			fup_data_quota_mb, fup_download_speed, fup_upload_speed, is_active
+		) VALUES (1, 'Day Pass', 'ZAR', 500, 1, '24:00:00', 86400, 3000, 1500, 2, 102400, 1000, 500, 1)
 	`)
 	if err != nil {
 		return fmt.Errorf("insert tariff plan: %w", err)
