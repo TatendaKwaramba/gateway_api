@@ -157,10 +157,6 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 	}, nil
 }
 
-func (s *Service) fulfillSubscription(ctx context.Context, req FulfillRequest) (*FulfillResult, error) {
-	return &FulfillResult{Success: true}, nil
-}
-
 func (s *Service) fulfillTopup(ctx context.Context, req FulfillRequest) (*FulfillResult, error) {
 	return &FulfillResult{Success: true}, nil
 }

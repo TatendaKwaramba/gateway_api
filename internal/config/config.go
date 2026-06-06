@@ -97,8 +97,8 @@ func (c *Config) Validate() error {
 		errs = append(errs, "DJANGO_INTERNAL_API_KEY must be at least 32 characters")
 	}
 	
-	// Paynow: if any credential is provided, all required ones must be present
-	paynowConfigured := c.PaynowIntegrationID != "" || c.PaynowIntegrationKey != "" || c.PaynowResultURL != "" || c.PaynowReturnURL != ""
+	// Paynow: credentials gate the integration; URLs alone must not block mock-only dev
+	paynowConfigured := c.PaynowIntegrationID != "" || c.PaynowIntegrationKey != ""
 	if paynowConfigured {
 		if c.PaynowIntegrationID == "" {
 			errs = append(errs, "PAYNOW_INTEGRATION_ID is required when Paynow is configured")
