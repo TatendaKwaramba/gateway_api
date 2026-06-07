@@ -153,6 +153,15 @@ func (s *Service) resolveOrCreateCustomer(ctx context.Context, req FulfillReques
 	var customerID int64
 	var lookupErr error
 
+	orgID, err := s.resolveOrganizationID(ctx, req)
+	if err != nil {
+		return 0, err
+	}
+	var orgVal interface{}
+	if orgID.Valid {
+		orgVal = orgID.Int64
+	}
+
 	if req.CustomerEmail != "" {
 		lookupErr = s.db.QueryRowContext(ctx, `
 			SELECT id FROM authentication_customer WHERE customer_email = ? LIMIT 1
@@ -164,6 +173,11 @@ func (s *Service) resolveOrCreateCustomer(ctx context.Context, req FulfillReques
 		`, req.CustomerPhone).Scan(&customerID)
 	}
 	if lookupErr == nil {
+		if orgID.Valid {
+			_, _ = s.db.ExecContext(ctx, `
+				UPDATE authentication_customer SET organization_id = ? WHERE id = ? AND organization_id IS NULL
+			`, orgID.Int64, customerID)
+		}
 		return customerID, nil
 	}
 	if lookupErr != sql.ErrNoRows {
@@ -179,9 +193,9 @@ func (s *Service) resolveOrCreateCustomer(ctx context.Context, req FulfillReques
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO authentication_customer (
 			customer_id, customer_type, customer_name, customer_email, customer_phone,
-			customer_address, customer_city, customer_password, is_active, created_at, updated_at
-		) VALUES (?, 'individual', ?, ?, ?, 'Online checkout', 'N/A', ?, TRUE, NOW(), NOW())
-	`, customerCode, username, req.CustomerEmail, req.CustomerPhone, username)
+			customer_address, customer_city, customer_password, organization_id, is_active, created_at, updated_at
+		) VALUES (?, 'individual', ?, ?, ?, 'Online checkout', 'N/A', ?, ?, TRUE, NOW(), NOW())
+	`, customerCode, username, req.CustomerEmail, req.CustomerPhone, username, orgVal)
 	if err != nil {
 		return 0, fmt.Errorf("fulfillment: create customer: %w", err)
 	}
