@@ -69,6 +69,16 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 		return nil, fmt.Errorf("fulfillment: failed to generate PIN: %w", err)
 	}
 
+	orgID, err := s.resolveOrganizationID(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	customerID, err := s.ensureVoucherCustomer(ctx, req, pin, orgID)
+	if err != nil {
+		return nil, err
+	}
+
 	timeLimit := time.Now().Add(time.Duration(tariffPlan.Seconds) * time.Second).Add(2 * time.Hour)
 	timeLimitStr := timeLimit.Format("2006-01-02 15:04:05.000000")
 
@@ -116,9 +126,9 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 
 	_, err = tx.ExecContext(ctx, `
 		UPDATE payments_paymenttransaction
-		SET voucher_pin = ?, completed_at = NOW(), updated_at = NOW()
+		SET voucher_pin = ?, customer_id = ?, completed_at = NOW(), updated_at = NOW()
 		WHERE id = ?
-	`, pin, req.TransactionID)
+	`, pin, customerID, req.TransactionID)
 	if err != nil {
 		return nil, fmt.Errorf("fulfillment: failed to update transaction: %w", err)
 	}
@@ -219,4 +229,71 @@ func errToString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func (s *Service) resolveOrganizationID(ctx context.Context, req FulfillRequest) (sql.NullInt64, error) {
+	if req.OrganizationID > 0 {
+		return sql.NullInt64{Int64: req.OrganizationID, Valid: true}, nil
+	}
+	if req.NasIPAddress != "" {
+		var orgID sql.NullInt64
+		err := s.db.QueryRowContext(ctx, `
+			SELECT organization_id FROM authentication_nasdevice
+			WHERE nas_ip_address = ? AND is_active = TRUE LIMIT 1
+		`, req.NasIPAddress).Scan(&orgID)
+		if err == nil && orgID.Valid {
+			return orgID, nil
+		}
+	}
+	if req.NasIdentifier != "" {
+		var orgID sql.NullInt64
+		err := s.db.QueryRowContext(ctx, `
+			SELECT organization_id FROM authentication_nasdevice
+			WHERE nas_identifier = ? AND is_active = TRUE LIMIT 1
+		`, req.NasIdentifier).Scan(&orgID)
+		if err == nil && orgID.Valid {
+			return orgID, nil
+		}
+	}
+	return sql.NullInt64{}, nil
+}
+
+func (s *Service) ensureVoucherCustomer(
+	ctx context.Context,
+	req FulfillRequest,
+	pin string,
+	orgID sql.NullInt64,
+) (int64, error) {
+	email := fmt.Sprintf("%s@voucher.local", pin)
+	var customerID int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id FROM authentication_customer WHERE customer_email = ? LIMIT 1
+	`, email).Scan(&customerID)
+	if err == nil {
+		if orgID.Valid {
+			_, _ = s.db.ExecContext(ctx, `
+				UPDATE authentication_customer SET organization_id = ? WHERE id = ? AND organization_id IS NULL
+			`, orgID.Int64, customerID)
+		}
+		return customerID, nil
+	}
+	if err != sql.ErrNoRows {
+		return 0, fmt.Errorf("fulfillment: lookup voucher customer: %w", err)
+	}
+
+	var orgVal interface{}
+	if orgID.Valid {
+		orgVal = orgID.Int64
+	}
+
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO authentication_customer (
+			customer_id, customer_type, customer_name, customer_email, customer_phone,
+			customer_address, customer_city, organization_id, is_active, created_at, updated_at
+		) VALUES (?, 'individual', ?, ?, ?, 'Payment voucher', 'N/A', ?, TRUE, NOW(), NOW())
+	`, fmt.Sprintf("voucher-%d", req.TransactionID), pin, email, req.CustomerPhone, orgVal)
+	if err != nil {
+		return 0, fmt.Errorf("fulfillment: create voucher customer: %w", err)
+	}
+	return res.LastInsertId()
 }

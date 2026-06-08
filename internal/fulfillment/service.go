@@ -36,6 +36,9 @@ type FulfillRequest struct {
 	CustomerPhone    string
 	CustomerEmail    string
 	FulfillmentKind  string
+	OrganizationID   int64
+	NasIPAddress     string
+	NasIdentifier    string
 }
 
 // FulfillResult contains the result of fulfillment

@@ -554,17 +554,20 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 	var amountFloat float64
 	var currency, customerPhone, customerEmail, fulfillmentKind, transactionIDStr string
 	var planID sql.NullInt64
+	var gatewayOrgID sql.NullInt64
+	var gatewayResponse sql.NullString
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
 			t.transaction_id, t.amount, t.currency,
 			t.customer_phone, t.customer_email, t.fulfillment_kind,
-			t.tariff_plan_id
+			t.tariff_plan_id, g.organization_id, t.gateway_response
 		FROM payments_paymenttransaction t
+		JOIN payments_paymentgateway g ON g.id = t.gateway_id
 		WHERE t.id = ?
 	`, transactionID).Scan(
 		&transactionIDStr, &amountFloat, &currency,
 		&customerPhone, &customerEmail, &fulfillmentKind,
-		&planID,
+		&planID, &gatewayOrgID, &gatewayResponse,
 	)
 	if err != nil {
 		slog.Error("fulfillment: failed to query transaction details",
@@ -576,6 +579,19 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 
 	amountCents := int64(amountFloat * 100)
 
+	var nasIP, nasID string
+	if gatewayResponse.Valid && gatewayResponse.String != "" {
+		var meta map[string]interface{}
+		if json.Unmarshal([]byte(gatewayResponse.String), &meta) == nil {
+			if v, ok := meta["nas_ip_address"].(string); ok {
+				nasIP = v
+			}
+			if v, ok := meta["nas_identifier"].(string); ok {
+				nasID = v
+			}
+		}
+	}
+
 	fr := fulfillment.FulfillRequest{
 		TransactionID:    transactionID,
 		TransactionIDStr: transactionIDStr,
@@ -584,6 +600,11 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 		CustomerPhone:    customerPhone,
 		CustomerEmail:    customerEmail,
 		FulfillmentKind:  fulfillmentKind,
+		NasIPAddress:     nasIP,
+		NasIdentifier:    nasID,
+	}
+	if gatewayOrgID.Valid {
+		fr.OrganizationID = gatewayOrgID.Int64
 	}
 	if planID.Valid {
 		fr.PlanID = planID.Int64
