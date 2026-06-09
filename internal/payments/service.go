@@ -54,6 +54,7 @@ func NewService(db *sql.DB, registry *gateways.Registry, fulfillmentService Fulf
 // InitiateRequest represents a request to initiate a payment
 type InitiateRequest struct {
 	GatewayCode      string            `json:"gateway_code"`
+	GatewayID        *int64            `json:"gateway_id,omitempty"` // F3.8: explicit org-scoped gateway
 	MethodCode       string            `json:"method_code"`
 	Amount           int64             `json:"amount"` // minor currency units (cents)
 	Currency         string            `json:"currency"`
@@ -82,14 +83,23 @@ type InitiateResponse struct {
 // Initiate creates a new payment transaction
 func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateResponse, error) {
 	// Validate request
-	if req.GatewayCode == "" {
-		return nil, fmt.Errorf("gateway_code is required")
+	if req.GatewayCode == "" && req.GatewayID == nil {
+		return nil, fmt.Errorf("gateway_code or gateway_id is required")
 	}
 	if req.Amount <= 0 {
 		return nil, fmt.Errorf("amount must be positive")
 	}
 	if req.Currency == "" {
 		return nil, fmt.Errorf("currency is required")
+	}
+
+	// F3.8: Resolve gateway code from gateway_id if not provided
+	if req.GatewayID != nil && req.GatewayCode == "" {
+		gatewayCode, err := s.resolveGatewayCode(ctx, *req.GatewayID)
+		if err != nil {
+			return nil, fmt.Errorf("gateway not found for id %d", *req.GatewayID)
+		}
+		req.GatewayCode = gatewayCode
 	}
 
 	if err := s.validateGatewayCurrency(ctx, req.GatewayCode, req.Currency); err != nil {
@@ -136,39 +146,96 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		planID = *req.PlanID
 	}
 
-	result, err := s.db.ExecContext(ctx, `
-		INSERT INTO payments_paymenttransaction (
-			transaction_id, gateway_id, payment_method_id, amount, currency,
-			tariff_plan_id,
-			state, status, customer_id, customer_email, customer_phone,
-			idempotency_key, fulfillment_kind, gateway_response, created_at, updated_at
-		)
-		SELECT 
-			?, g.id, pm.id, ?, ?, ?,
-			'initiated', 'initiated', ?, ?, ?,
-			?, ?, JSON_OBJECT(), NOW(), NOW()
-		FROM payments_paymentgateway g
-		LEFT JOIN payments_paymentmethod pm ON pm.gateway_id = g.id AND pm.method_code = ?
-		WHERE g.gateway_code = ?
-	`,
-		transactionIDStr,
-		float64(req.Amount)/100.0,
-		req.Currency,
-		planID,
-		req.CustomerID,
-		req.CustomerEmail,
-		req.CustomerPhone,
-		req.IdempotencyKey,
-		fulfillmentKind,
-		req.MethodCode,
-		req.GatewayCode,
-	)
-	
-	if err != nil {
-		return nil, fmt.Errorf("failed to create transaction: %w", err)
+	var transactionID int64
+
+	// Tier 2: Resolve organization_id from gateway and calculate fees
+	var orgID *int64
+	var feeAmount float64
+	gatewayOrgID, _ := s.resolveGatewayOrgID(ctx, req.GatewayCode, req.GatewayID)
+	if gatewayOrgID > 0 {
+		orgID = &gatewayOrgID
 	}
-	
-	transactionID, _ := result.LastInsertId()
+	feeAmount = s.calculateFee(ctx, req.GatewayCode, req.GatewayID, float64(req.Amount)/100.0)
+	netAmount := float64(req.Amount)/100.0 - feeAmount
+
+	// F3.8: When gateway_id is provided, insert directly without gateway_code join
+	if req.GatewayID != nil {
+		_, err := s.db.ExecContext(ctx, `
+			INSERT INTO payments_paymenttransaction (
+				transaction_id, gateway_id, payment_method_id, amount, currency,
+				tariff_plan_id,
+				state, status, customer_id, customer_email, customer_phone,
+				idempotency_key, fulfillment_kind, gateway_response,
+				organization_id, fee_amount, net_amount,
+				created_at, updated_at
+			)
+			SELECT 
+				?, ?, pm.id, ?, ?, ?,
+				'initiated', 'initiated', ?, ?, ?,
+				?, ?, JSON_OBJECT(),
+				?, ?, ?,
+				NOW(), NOW()
+			FROM payments_paymentmethod pm
+			WHERE pm.gateway_id = ? AND pm.method_code = ?
+		`,
+			transactionIDStr,
+			*req.GatewayID,
+			float64(req.Amount)/100.0,
+			req.Currency,
+			planID,
+			req.CustomerID,
+			req.CustomerEmail,
+			req.CustomerPhone,
+			req.IdempotencyKey,
+			fulfillmentKind,
+			orgID,
+			feeAmount,
+			netAmount,
+			*req.GatewayID,
+			req.MethodCode,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create transaction: %w", err)
+		}
+	} else {
+		result, err := s.db.ExecContext(ctx, `
+			INSERT INTO payments_paymenttransaction (
+				transaction_id, gateway_id, payment_method_id, amount, currency,
+				tariff_plan_id,
+				state, status, customer_id, customer_email, customer_phone,
+				idempotency_key, fulfillment_kind, gateway_response,
+				organization_id, fee_amount, net_amount,
+				created_at, updated_at
+			)
+			SELECT 
+				?, g.id, pm.id, ?, ?, ?,
+				'initiated', 'initiated', ?, ?, ?,
+				?, ?, JSON_OBJECT(),
+				g.organization_id, ?, ?,
+				NOW(), NOW()
+			FROM payments_paymentgateway g
+			LEFT JOIN payments_paymentmethod pm ON pm.gateway_id = g.id AND pm.method_code = ?
+			WHERE g.gateway_code = ?
+		`,
+			transactionIDStr,
+			float64(req.Amount)/100.0,
+			req.Currency,
+			planID,
+			req.CustomerID,
+			req.CustomerEmail,
+			req.CustomerPhone,
+			req.IdempotencyKey,
+			fulfillmentKind,
+			feeAmount,
+			netAmount,
+			req.MethodCode,
+			req.GatewayCode,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create transaction: %w", err)
+		}
+		transactionID, _ = result.LastInsertId()
+	}
 	
 	slog.Info("transaction created",
 		slog.Int64("transaction_id", transactionID),
@@ -727,6 +794,74 @@ func (s *Service) validateGatewayCurrency(ctx context.Context, gatewayCode, curr
 	return nil
 }
 
+// resolveGatewayCode returns the gateway_code for a given gateway_id
+func (s *Service) resolveGatewayCode(ctx context.Context, gatewayID int64) (string, error) {
+	var code string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT gateway_code FROM payments_paymentgateway WHERE id = ?
+	`, gatewayID).Scan(&code)
+	if err != nil {
+		return "", fmt.Errorf("gateway not found: %w", err)
+	}
+	return code, nil
+}
+
+// resolveGatewayOrgID returns the organization_id from the gateway (0 if null).
+func (s *Service) resolveGatewayOrgID(ctx context.Context, gatewayCode string, gatewayID *int64) (int64, error) {
+	var orgID sql.NullInt64
+	if gatewayID != nil {
+		err := s.db.QueryRowContext(ctx, `
+			SELECT organization_id FROM payments_paymentgateway WHERE id = ?
+		`, *gatewayID).Scan(&orgID)
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		err := s.db.QueryRowContext(ctx, `
+			SELECT organization_id FROM payments_paymentgateway WHERE gateway_code = ?
+		`, gatewayCode).Scan(&orgID)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if orgID.Valid {
+		return orgID.Int64, nil
+	}
+	return 0, nil
+}
+
+// calculateFee looks up the best-matching FeeSchedule and computes the fee for the amount.
+func (s *Service) calculateFee(ctx context.Context, gatewayCode string, gatewayID *int64, amount float64) float64 {
+	// Try org-specific, then gateway-specific, then platform-wide default
+	// Order by priority DESC, take first match
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT fs.fee_type, fs.percentage, fs.flat_amount
+		FROM payments_feeschedule fs
+		LEFT JOIN payments_paymentgateway g ON fs.gateway_id = g.id
+		WHERE fs.is_active = 1
+		  AND (fs.gateway_id IS NULL OR g.gateway_code = ?)
+		ORDER BY fs.priority DESC
+		LIMIT 1
+	`, gatewayCode)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		var feeType string
+		var percentage, flatAmount float64
+		if err := rows.Scan(&feeType, &percentage, &flatAmount); err != nil {
+			return 0
+		}
+		if feeType == "percentage" {
+			return amount * percentage / 100.0
+		}
+		return flatAmount
+	}
+	return 0
+}
+
 func (s *Service) validatePlanAmount(ctx context.Context, planID, amount int64, currency string) error {
 	var price int64
 	var planCurrency string
@@ -879,6 +1014,7 @@ type GatewayFees struct {
 
 // Gateway represents a payment gateway from the database
 type Gateway struct {
+	ID            int64           `json:"id"` // F3.8: explicit gateway ID for org-scoped resolution
 	Code          string          `json:"code"`
 	Name          string          `json:"name"`
 	Description   string          `json:"description"`
@@ -891,7 +1027,7 @@ type Gateway struct {
 func (s *Service) ListGateways(ctx context.Context) ([]*Gateway, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT 
-			gateway_code,
+			id, gateway_code,
 			name,
 			description,
 			configuration
@@ -909,7 +1045,7 @@ func (s *Service) ListGateways(ctx context.Context) ([]*Gateway, error) {
 		var g Gateway
 		var configJSON []byte
 		err := rows.Scan(
-			&g.Code, &g.Name, &g.Description, &configJSON,
+			&g.ID, &g.Code, &g.Name, &g.Description, &configJSON,
 		)
 		if err != nil {
 			slog.Warn("failed to scan gateway", slog.Any("error", err))
