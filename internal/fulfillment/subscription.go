@@ -104,6 +104,49 @@ func (s *Service) fulfillSubscription(ctx context.Context, req FulfillRequest) (
 		return nil, fmt.Errorf("fulfillment: upsert radcheck password: %w", err)
 	}
 
+	// Write radreply entries for SQL authorize fallback.
+	// Keeps radreply fresh so FreeRADIUS can authorize from SQL when API is down.
+	dlSpeed := fmt.Sprintf("%dk", plan.DownloadSpeed)
+	ulSpeed := fmt.Sprintf("%dk", plan.UploadSpeed)
+	rateLimit := dlSpeed + "/" + ulSpeed
+
+	_, err = tx.ExecContext(ctx, "DELETE FROM radreply WHERE username = ?", customerUsername)
+	if err != nil {
+		return nil, fmt.Errorf("fulfillment: clear radreply: %w", err)
+	}
+
+	radreplyAttrs := []struct{ attr, value string }{
+		{"Reply-Message", "Cached by Flash API"},
+		{"Mikrotik-Rate-Limit", rateLimit},
+		{"Mikrotik-Recv-Limit", "1000000000000"},
+		{"Mikrotik-Xmit-Limit", "1000000000000"},
+		{"Acct-Interim-Interval", "300"},
+		{"Session-Timeout", fmt.Sprintf("%d", periodDays*86400)},
+	}
+	for _, a := range radreplyAttrs {
+		_, err = tx.ExecContext(ctx,
+			"INSERT INTO radreply (username, attribute, op, value) VALUES (?, ?, '=', ?)",
+			customerUsername, a.attr, a.value,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("fulfillment: insert radreply %s: %w", a.attr, err)
+		}
+	}
+
+	// Add Framed-Pool if pool is configured
+	if plan.DefaultPoolID.Valid {
+		var poolName string
+		err = tx.QueryRowContext(ctx,
+			"SELECT name FROM ipam_ippool WHERE id = ?", plan.DefaultPoolID.Int64,
+		).Scan(&poolName)
+		if err == nil && poolName != "" {
+			_, _ = tx.ExecContext(ctx,
+				"INSERT INTO radreply (username, attribute, op, value) VALUES (?, 'Framed-Pool', '=', ?)",
+				customerUsername, poolName,
+			)
+		}
+	}
+
 	_, err = tx.ExecContext(ctx, `
 		UPDATE payments_paymenttransaction
 		SET completed_at = NOW(), updated_at = NOW(),

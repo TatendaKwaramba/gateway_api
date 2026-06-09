@@ -104,6 +104,36 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 		return nil, fmt.Errorf("fulfillment: failed to insert radcheck time-limit: %w", err)
 	}
 
+	// Write radreply entries for SQL authorize fallback.
+	// Keeps radreply fresh so FreeRADIUS can authorize from SQL when API is down.
+	dlSpeed := fmt.Sprintf("%dk", tariffPlan.DownloadSpeed)
+	ulSpeed := fmt.Sprintf("%dk", tariffPlan.UploadSpeed)
+	rateLimit := dlSpeed + "/" + ulSpeed
+
+	_, err = tx.ExecContext(ctx, "DELETE FROM radreply WHERE username = ?", pin)
+	if err != nil {
+		return nil, fmt.Errorf("fulfillment: clear radreply: %w", err)
+	}
+
+	radreplyAttrs := []struct{ attr, value string }{
+		{"Reply-Message", "Cached by Flash API"},
+		{"Mikrotik-Rate-Limit", rateLimit},
+		{"Mikrotik-Recv-Limit", "1000000000000"},
+		{"Mikrotik-Xmit-Limit", "1000000000000"},
+		{"Acct-Interim-Interval", "300"},
+		{"Session-Timeout", fmt.Sprintf("%d", tariffPlan.Seconds)},
+		{"Simultaneous-Use", fmt.Sprintf("%d", tariffPlan.MaxSessions)},
+	}
+	for _, a := range radreplyAttrs {
+		_, err = tx.ExecContext(ctx,
+			"INSERT INTO radreply (username, attribute, op, value) VALUES (?, ?, '=', ?)",
+			pin, a.attr, a.value,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("fulfillment: insert radreply %s: %w", a.attr, err)
+		}
+	}
+
 	var radcheckID int64
 	err = tx.QueryRowContext(ctx, `
 		SELECT id FROM radcheck WHERE username = ? AND attribute = 'Time-Limit'
