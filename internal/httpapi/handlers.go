@@ -69,6 +69,7 @@ func (r *Router) listPaymentMethods(w http.ResponseWriter, req *http.Request) {
 // initiatePaymentRequest represents a payment initiation request
 type initiatePaymentRequest struct {
 	GatewayCode      string            `json:"gateway_code"`
+	GatewayID        *int64            `json:"gateway_id,omitempty"` // F3.8: explicit org-scoped gateway
 	MethodCode       string            `json:"method_code"`
 	Amount           int64             `json:"amount"`
 	Currency         string            `json:"currency"`
@@ -90,8 +91,8 @@ func (r *Router) initiatePayment(w http.ResponseWriter, req *http.Request) {
 	}
 	
 	// Validate required fields
-	if reqBody.GatewayCode == "" {
-		respondError(w, http.StatusBadRequest, "gateway_code is required")
+	if reqBody.GatewayCode == "" && reqBody.GatewayID == nil {
+		respondError(w, http.StatusBadRequest, "gateway_code or gateway_id is required")
 		return
 	}
 	if reqBody.Amount <= 0 {
@@ -106,6 +107,7 @@ func (r *Router) initiatePayment(w http.ResponseWriter, req *http.Request) {
 	// Initiate payment
 	result, err := r.paymentService.Initiate(req.Context(), payments.InitiateRequest{
 		GatewayCode:      reqBody.GatewayCode,
+		GatewayID:        reqBody.GatewayID,
 		MethodCode:       reqBody.MethodCode,
 		Amount:           reqBody.Amount,
 		Currency:         reqBody.Currency,
