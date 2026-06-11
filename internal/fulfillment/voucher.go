@@ -316,12 +316,23 @@ func (s *Service) ensureVoucherCustomer(
 		orgVal = orgID.Int64
 	}
 
+	// Resolve referral agent by referral code
+	var referredByVal interface{}
+	if req.ReferralCode != "" {
+		var agentID int64
+		if err := s.db.QueryRowContext(ctx, `
+			SELECT id FROM sales_agentprofile WHERE referral_code = ? AND status = 'active' LIMIT 1
+		`, req.ReferralCode).Scan(&agentID); err == nil {
+			referredByVal = agentID
+		}
+	}
+
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO authentication_customer (
 			customer_id, customer_type, customer_name, customer_email, customer_phone,
-			customer_address, customer_city, organization_id, is_active, created_at, updated_at
-		) VALUES (?, 'individual', ?, ?, ?, 'Payment voucher', 'N/A', ?, TRUE, NOW(), NOW())
-	`, fmt.Sprintf("voucher-%d", req.TransactionID), pin, email, req.CustomerPhone, orgVal)
+			customer_address, customer_city, organization_id, referred_by, is_active, created_at, updated_at
+		) VALUES (?, 'individual', ?, ?, ?, 'Payment voucher', 'N/A', ?, ?, TRUE, NOW(), NOW())
+	`, fmt.Sprintf("voucher-%d", req.TransactionID), pin, email, req.CustomerPhone, orgVal, referredByVal)
 	if err != nil {
 		return 0, fmt.Errorf("fulfillment: create voucher customer: %w", err)
 	}

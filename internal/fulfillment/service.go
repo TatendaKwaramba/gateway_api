@@ -39,6 +39,7 @@ type FulfillRequest struct {
 	OrganizationID   int64
 	NasIPAddress     string
 	NasIdentifier    string
+	ReferralCode     string
 }
 
 // FulfillResult contains the result of fulfillment

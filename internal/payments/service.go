@@ -146,6 +146,14 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		planID = *req.PlanID
 	}
 
+	// Serialize metadata to JSON for gateway_response storage
+	gatewayResponseJSON := "{}"
+	if len(req.Metadata) > 0 {
+		if b, err := json.Marshal(req.Metadata); err == nil {
+			gatewayResponseJSON = string(b)
+		}
+	}
+
 	var transactionID int64
 
 	// Tier 2: Resolve organization_id from gateway and calculate fees
@@ -172,7 +180,7 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 			SELECT 
 				?, ?, pm.id, ?, ?, ?,
 				'initiated', 'initiated', ?, ?, ?,
-				?, ?, JSON_OBJECT(),
+				?, ?, ?,
 				?, ?, ?,
 				NOW(), NOW()
 			FROM payments_paymentmethod pm
@@ -188,6 +196,7 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 			req.CustomerPhone,
 			req.IdempotencyKey,
 			fulfillmentKind,
+			gatewayResponseJSON,
 			orgID,
 			feeAmount,
 			netAmount,
@@ -210,7 +219,7 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 			SELECT 
 				?, g.id, pm.id, ?, ?, ?,
 				'initiated', 'initiated', ?, ?, ?,
-				?, ?, JSON_OBJECT(),
+				?, ?, ?,
 				g.organization_id, ?, ?,
 				NOW(), NOW()
 			FROM payments_paymentgateway g
@@ -226,6 +235,7 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 			req.CustomerPhone,
 			req.IdempotencyKey,
 			fulfillmentKind,
+			gatewayResponseJSON,
 			feeAmount,
 			netAmount,
 			req.MethodCode,
@@ -272,8 +282,16 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		return nil, fmt.Errorf("gateway initiation failed: %w", err)
 	}
 	
-	// Serialize gateway response for storage
-	gatewayResponseJSON, _ := json.Marshal(gatewayResult)
+	// Merge gateway result into existing metadata (preserving referral_code etc.)
+	mergedResponse := make(map[string]interface{})
+	if len(req.Metadata) > 0 {
+		for k, v := range req.Metadata {
+			mergedResponse[k] = v
+		}
+	}
+	mergedResponse["state"] = gatewayResult.State
+	mergedResponse["external_reference"] = gatewayResult.ExternalReference
+	gatewayResultJSON, _ := json.Marshal(mergedResponse)
 	
 	// Update transaction with gateway response
 	_, err = s.db.ExecContext(ctx, `
@@ -285,7 +303,7 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		gatewayResult.State,
 		gatewayResult.State,
 		gatewayResult.ExternalReference,
-		string(gatewayResponseJSON),
+		string(gatewayResultJSON),
 		transactionID,
 	)
 	
@@ -646,7 +664,7 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 
 	amountCents := int64(amountFloat * 100)
 
-	var nasIP, nasID string
+	var nasIP, nasID, referralCode string
 	if gatewayResponse.Valid && gatewayResponse.String != "" {
 		var meta map[string]interface{}
 		if json.Unmarshal([]byte(gatewayResponse.String), &meta) == nil {
@@ -655,6 +673,9 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 			}
 			if v, ok := meta["nas_identifier"].(string); ok {
 				nasID = v
+			}
+			if v, ok := meta["referral_code"].(string); ok {
+				referralCode = v
 			}
 		}
 	}
@@ -669,6 +690,7 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 		FulfillmentKind:  fulfillmentKind,
 		NasIPAddress:     nasIP,
 		NasIdentifier:    nasID,
+		ReferralCode:     referralCode,
 	}
 	if gatewayOrgID.Valid {
 		fr.OrganizationID = gatewayOrgID.Int64

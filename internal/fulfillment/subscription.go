@@ -233,12 +233,23 @@ func (s *Service) resolveOrCreateCustomer(ctx context.Context, req FulfillReques
 	}
 	customerCode := fmt.Sprintf("sub-%d", req.TransactionID)
 
+	// Resolve referral agent by referral code
+	var referredByVal interface{}
+	if req.ReferralCode != "" {
+		var agentID int64
+		if err := s.db.QueryRowContext(ctx, `
+			SELECT id FROM sales_agentprofile WHERE referral_code = ? AND status = 'active' LIMIT 1
+		`, req.ReferralCode).Scan(&agentID); err == nil {
+			referredByVal = agentID
+		}
+	}
+
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO authentication_customer (
 			customer_id, customer_type, customer_name, customer_email, customer_phone,
-			customer_address, customer_city, customer_password, organization_id, is_active, created_at, updated_at
-		) VALUES (?, 'individual', ?, ?, ?, 'Online checkout', 'N/A', ?, ?, TRUE, NOW(), NOW())
-	`, customerCode, username, req.CustomerEmail, req.CustomerPhone, username, orgVal)
+			customer_address, customer_city, customer_password, organization_id, referred_by, is_active, created_at, updated_at
+		) VALUES (?, 'individual', ?, ?, ?, 'Online checkout', 'N/A', ?, ?, ?, TRUE, NOW(), NOW())
+	`, customerCode, username, req.CustomerEmail, req.CustomerPhone, username, orgVal, referredByVal)
 	if err != nil {
 		return 0, fmt.Errorf("fulfillment: create customer: %w", err)
 	}
