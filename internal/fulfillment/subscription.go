@@ -233,12 +233,15 @@ func (s *Service) resolveOrCreateCustomer(ctx context.Context, req FulfillReques
 	}
 	customerCode := fmt.Sprintf("sub-%d", req.TransactionID)
 
-	// Resolve referral agent by referral code
+	// Resolve referral agent by referral link code (REF-XXXXXXXX from cookie)
 	var referredByVal interface{}
 	if req.ReferralCode != "" {
 		var agentID int64
 		if err := s.db.QueryRowContext(ctx, `
-			SELECT id FROM sales_agentprofile WHERE referral_code = ? AND status = 'active' LIMIT 1
+			SELECT ap.id FROM sales_agentprofile ap
+			JOIN sales_referrallink rl ON rl.agent_id = ap.id
+			WHERE rl.code = ? AND rl.is_active = TRUE AND ap.status = 'active'
+			LIMIT 1
 		`, req.ReferralCode).Scan(&agentID); err == nil {
 			referredByVal = agentID
 		}
