@@ -1,12 +1,14 @@
 package payments
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/freeradius/payments-api/internal/django"
@@ -718,6 +720,9 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 		slog.Int64("transaction_id", transactionID),
 		slog.String("voucher_pin", result.VoucherPIN),
 	)
+
+	// Notify Django of payment completion (triggers commission processing)
+	go s.notifyDjangoCompletion(transactionID, referralCode)
 }
 
 // PollStatus checks the current status of a transaction via the gateway's API.
@@ -959,6 +964,67 @@ func (s *Service) ListPlans(ctx context.Context) ([]*Plan, error) {
 // TriggerFulfillment exposes triggerFulfillment for external callers (e.g., poller).
 func (s *Service) TriggerFulfillment(transactionID int64) {
 	s.triggerFulfillment(transactionID)
+}
+
+// notifyDjangoCompletion POSTs to Django webhook to trigger commission processing.
+func (s *Service) notifyDjangoCompletion(transactionID int64, referralCode string) {
+	ctx := context.Background()
+
+	// Look up customer_id for this transaction
+	var customerID sql.NullInt64
+	_ = s.db.QueryRowContext(ctx, `
+		SELECT customer_id FROM payments_paymenttransaction WHERE id = ?
+	`, transactionID).Scan(&customerID)
+
+	payload := map[string]interface{}{
+		"transaction_id": transactionID,
+		"state":          "completed",
+		"referral_code":  referralCode,
+	}
+	if customerID.Valid {
+		payload["customer_id"] = customerID.Int64
+	}
+
+	body, _ := json.Marshal(payload)
+
+	djangoBaseURL := os.Getenv("DJANGO_BASE_URL")
+	if djangoBaseURL == "" {
+		djangoBaseURL = "http://flash-api:8000"
+	}
+	internalKey := os.Getenv("DJANGO_INTERNAL_API_KEY")
+
+	url := djangoBaseURL + "/api/sales-agents/webhooks/payment-completed/"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		slog.Error("webhook: failed to create request", slog.Any("error", err))
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Internal-API-Key", internalKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		slog.Error("webhook: failed to notify Django",
+			slog.Int64("transaction_id", transactionID),
+			slog.Any("error", err),
+		)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		slog.Error("webhook: Django returned error",
+			slog.Int64("transaction_id", transactionID),
+			slog.Int("status", resp.StatusCode),
+		)
+		return
+	}
+
+	slog.Info("webhook: Django notified of payment completion",
+		slog.Int64("transaction_id", transactionID),
+		slog.Int("status", resp.StatusCode),
+	)
 }
 
 // MethodDetails represents the method object nested in PaymentMethod
