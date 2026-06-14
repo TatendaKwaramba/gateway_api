@@ -1033,6 +1033,7 @@ func (s *Service) ListSubscriptionPlans(ctx context.Context) ([]*Plan, error) {
 }
 
 // TriggerFulfillment exposes triggerFulfillment for external callers (e.g., poller).
+func (s *Service) TriggerFulfillment(transactionID int64) {
 	s.triggerFulfillment(transactionID)
 }
 
