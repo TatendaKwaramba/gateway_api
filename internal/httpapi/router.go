@@ -74,6 +74,9 @@ func (r *Router) Setup() chi.Router {
 		// Tariff plans
 		api.Get("/plans", r.listPlans)
 
+		// Subscription plans
+		api.Get("/subscription-plans", r.listSubscriptionPlans)
+
 		// Payment gateways
 		api.Get("/payments/gateways", r.listGateways)
 

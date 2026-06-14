@@ -109,7 +109,7 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 	}
 
 	if req.PlanID != nil {
-		if err := s.validatePlanAmount(ctx, *req.PlanID, req.Amount, req.Currency); err != nil {
+		if err := s.validatePlanAmount(ctx, *req.PlanID, req.Amount, req.Currency, req.FulfillmentKind); err != nil {
 			return nil, err
 		}
 	}
@@ -801,6 +801,7 @@ type Plan struct {
 	FupDownloadSpeed   int64   `json:"fup_download_speed"`
 	FupUploadSpeed     int64   `json:"fup_upload_speed"`
 	MarketingTagline   string  `json:"marketing_tagline,omitempty"`
+	PlanType           string  `json:"plan_type"` // "hotspot" | "subscription" | "smoke"
 }
 
 func (s *Service) validateGatewayCurrency(ctx context.Context, gatewayCode, currency string) error {
@@ -889,7 +890,29 @@ func (s *Service) calculateFee(ctx context.Context, gatewayCode string, gatewayI
 	return 0
 }
 
-func (s *Service) validatePlanAmount(ctx context.Context, planID, amount int64, currency string) error {
+func (s *Service) validatePlanAmount(ctx context.Context, planID, amount int64, currency string, fulfillmentKind string) error {
+	if fulfillmentKind == "subscription" {
+		var price int64
+		var planCurrency string
+		err := s.db.QueryRowContext(ctx, `
+			SELECT price_minor, COALESCE(currency, ?) FROM services_subscriptionplan
+			WHERE id = ? AND is_active = 1
+		`, s.defaultCurrency, planID).Scan(&price, &planCurrency)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("subscription plan not found: %d", planID)
+		}
+		if err != nil {
+			return fmt.Errorf("subscription plan lookup failed: %w", err)
+		}
+		if price != amount {
+			return fmt.Errorf("amount %d does not match subscription plan price %d", amount, price)
+		}
+		if planCurrency != "" && currency != planCurrency {
+			return fmt.Errorf("currency %s does not match subscription plan currency %s", currency, planCurrency)
+		}
+		return nil
+	}
+	// Default: validate against hotspot tariff plan
 	var price int64
 	var planCurrency string
 	err := s.db.QueryRowContext(ctx, `
@@ -918,7 +941,8 @@ func (s *Service) ListPlans(ctx context.Context) ([]*Plan, error) {
 			price, currency, seconds, duration_days,
 			download_speed, upload_speed, max_sessions,
 			fup_data_quota_mb, fup_download_speed, fup_upload_speed,
-			COALESCE(marketing_tagline, '')
+			COALESCE(marketing_tagline, ''),
+			COALESCE(plan_kind, 'hotspot')
 		FROM services_tariffplan
 		WHERE is_active = 1 AND (plan_kind IS NULL OR plan_kind != 'smoke')
 		ORDER BY price ASC
@@ -936,7 +960,7 @@ func (s *Service) ListPlans(ctx context.Context) ([]*Plan, error) {
 			&p.ID, &label, &p.Price, &p.Currency, &p.DurationSeconds, &p.DurationDays,
 			&p.DownloadSpeed, &p.UploadSpeed, &p.MaxSessions,
 			&p.FupDataQuotaMb, &p.FupDownloadSpeed, &p.FupUploadSpeed,
-			&p.MarketingTagline,
+			&p.MarketingTagline, &p.PlanType,
 		)
 		if err != nil {
 			slog.Warn("failed to scan plan", slog.Any("error", err))
@@ -961,8 +985,54 @@ func (s *Service) ListPlans(ctx context.Context) ([]*Plan, error) {
 	return plans, nil
 }
 
+// ListSubscriptionPlans returns all active subscription plans ordered by price
+func (s *Service) ListSubscriptionPlans(ctx context.Context) ([]*Plan, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sp.id, sp.name,
+			sp.price_minor, COALESCE(sp.currency, ?),
+			sp.billing_period_days,
+			sp.download_speed, sp.upload_speed, sp.max_sessions,
+			COALESCE(sp.fup_data_quota_mb, 0),
+			COALESCE(sp.fup_download_speed, 0),
+			COALESCE(sp.fup_upload_speed, 0)
+		FROM services_subscriptionplan sp
+		WHERE sp.is_active = 1
+		ORDER BY sp.price_minor ASC
+	`, s.defaultCurrency)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query subscription plans: %w", err)
+	}
+	defer rows.Close()
+
+	var plans []*Plan
+	for rows.Next() {
+		var p Plan
+		err := rows.Scan(
+			&p.ID, &p.Name, &p.Price,
+			&p.Currency, &p.DurationDays,
+			&p.DownloadSpeed, &p.UploadSpeed, &p.MaxSessions,
+			&p.FupDataQuotaMb, &p.FupDownloadSpeed, &p.FupUploadSpeed,
+		)
+		if err != nil {
+			slog.Warn("failed to scan subscription plan", slog.Any("error", err))
+			continue
+		}
+		if p.Currency == "" {
+			p.Currency = s.defaultCurrency
+		}
+		p.DisplayAmount = float64(p.Price) / 100.0
+		p.PlanType = "subscription"
+		plans = append(plans, &p)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating subscription plans: %w", err)
+	}
+
+	return plans, nil
+}
+
 // TriggerFulfillment exposes triggerFulfillment for external callers (e.g., poller).
-func (s *Service) TriggerFulfillment(transactionID int64) {
 	s.triggerFulfillment(transactionID)
 }
 

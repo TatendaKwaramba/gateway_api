@@ -31,6 +31,20 @@ func (r *Router) listPlans(w http.ResponseWriter, req *http.Request) {
 	})
 }
 
+// listSubscriptionPlans returns active subscription plans
+func (r *Router) listSubscriptionPlans(w http.ResponseWriter, req *http.Request) {
+	plans, err := r.paymentService.ListSubscriptionPlans(req.Context())
+	if err != nil {
+		slog.Error("failed to list subscription plans", slog.Any("error", err))
+		respondError(w, http.StatusInternalServerError, "failed to list subscription plans")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"plans": plans,
+	})
+}
+
 // listGateways returns available payment gateways with fees
 func (r *Router) listGateways(w http.ResponseWriter, req *http.Request) {
 	gateways, err := r.paymentService.ListGateways(req.Context())
