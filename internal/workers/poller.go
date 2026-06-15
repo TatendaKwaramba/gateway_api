@@ -90,14 +90,19 @@ func (p *Poller) run(ctx context.Context) {
 	var checked int
 	for rows.Next() {
 		var transactionID int64
-		var externalRef, gatewayCode, currentState string
+		var externalRef sql.NullString
+		var gatewayCode, currentState string
 		var createdAt time.Time
 		if err := rows.Scan(&transactionID, &externalRef, &gatewayCode, &currentState, &createdAt); err != nil {
 			slog.Error("poller: failed to scan row", slog.Any("error", err))
 			continue
 		}
+		externalRefStr := ""
+		if externalRef.Valid {
+			externalRefStr = externalRef.String
+		}
 		checked++
-		p.processTransaction(ctx, transactionID, externalRef, gatewayCode, currentState, createdAt)
+		p.processTransaction(ctx, transactionID, externalRefStr, gatewayCode, currentState, createdAt)
 	}
 
 	// Also mark any pending transactions older than maxPollAge as failed

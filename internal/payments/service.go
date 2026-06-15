@@ -170,7 +170,7 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 
 	// F3.8: When gateway_id is provided, insert directly without gateway_code join
 	if req.GatewayID != nil {
-		_, err := s.db.ExecContext(ctx, `
+		result, err := s.db.ExecContext(ctx, `
 			INSERT INTO payments_paymenttransaction (
 				transaction_id, gateway_id, payment_method_id, amount, currency,
 				tariff_plan_id,
@@ -208,6 +208,7 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		if err != nil {
 			return nil, fmt.Errorf("failed to create transaction: %w", err)
 		}
+		transactionID, _ = result.LastInsertId()
 	} else {
 		result, err := s.db.ExecContext(ctx, `
 			INSERT INTO payments_paymenttransaction (
@@ -247,6 +248,15 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 			return nil, fmt.Errorf("failed to create transaction: %w", err)
 		}
 		transactionID, _ = result.LastInsertId()
+	}
+	
+	// LastInsertId() may return 0 with INSERT...SELECT; query back the actual ID
+	if transactionID == 0 {
+		if err := s.db.QueryRowContext(ctx, 
+			`SELECT id FROM payments_paymenttransaction WHERE transaction_id = ?`, transactionIDStr,
+		).Scan(&transactionID); err != nil {
+			return nil, fmt.Errorf("failed to retrieve transaction ID after insert: %w", err)
+		}
 	}
 	
 	slog.Info("transaction created",
@@ -975,6 +985,9 @@ func (s *Service) ListPlans(ctx context.Context) ([]*Plan, error) {
 			p.Currency = s.defaultCurrency
 		}
 		p.DisplayAmount = float64(p.Price) / 100.0
+		if p.PlanType == "hotspot_voucher" {
+			p.PlanType = "hotspot"
+		}
 		plans = append(plans, &p)
 	}
 
