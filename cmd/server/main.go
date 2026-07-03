@@ -15,6 +15,7 @@ import (
 	"github.com/freeradius/payments-api/internal/django"
 	"github.com/freeradius/payments-api/internal/fulfillment"
 	"github.com/freeradius/payments-api/internal/gateways"
+	"github.com/freeradius/payments-api/internal/gateways/ecocash"
 	"github.com/freeradius/payments-api/internal/gateways/mock"
 	"github.com/freeradius/payments-api/internal/gateways/paynow"
 	"github.com/freeradius/payments-api/internal/httpapi"
@@ -82,6 +83,25 @@ func main() {
 		)
 		if err := registry.Register(paynowAdapter); err != nil {
 			slog.Error("failed to register paynow gateway", slog.Any("error", err))
+			os.Exit(1)
+		}
+	}
+
+	// Register EcoCash gateway if credentials are configured
+	if cfg.EcoCashAPIKey != "" && cfg.EcoCashMerchantCode != "" {
+		slog.Info("registering ecocash gateway")
+		ecocashAdapter := ecocash.NewAdapter(
+			cfg.EcoCashAPIKey,
+			cfg.EcoCashMerchantCode,
+			cfg.EcoCashMerchantPin,
+			cfg.EcoCashMerchantNumber,
+			cfg.EcoCashTerminalID,
+			cfg.EcoCashBaseURL,
+			cfg.EcoCashNotifyURL,
+			cfg.EcoCashReturnURL,
+		)
+		if err := registry.Register(ecocashAdapter); err != nil {
+			slog.Error("failed to register ecocash gateway", slog.Any("error", err))
 			os.Exit(1)
 		}
 	}

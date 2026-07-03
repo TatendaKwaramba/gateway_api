@@ -35,6 +35,16 @@ type Config struct {
 	PaynowIntegrationKey string `envconfig:"PAYNOW_INTEGRATION_KEY"`
 	PaynowResultURL     string `envconfig:"PAYNOW_RESULT_URL"`
 	PaynowReturnURL     string `envconfig:"PAYNOW_RETURN_URL"`
+
+	// EcoCash direct gateway (developers.ecocash.co.zw)
+	EcoCashAPIKey         string `envconfig:"ECOCASH_API_KEY"`
+	EcoCashMerchantCode   string `envconfig:"ECOCASH_MERCHANT_CODE"`
+	EcoCashMerchantPin    string `envconfig:"ECOCASH_MERCHANT_PIN"`
+	EcoCashMerchantNumber string `envconfig:"ECOCASH_MERCHANT_NUMBER"`
+	EcoCashTerminalID     string `envconfig:"ECOCASH_TERMINAL_ID"`
+	EcoCashBaseURL        string `envconfig:"ECOCASH_BASE_URL" default:"https://developers.ecocash.co.zw/sandbox"`
+	EcoCashNotifyURL      string `envconfig:"ECOCASH_NOTIFY_URL"`
+	EcoCashReturnURL      string `envconfig:"ECOCASH_RETURN_URL"`
 	
 	// Django internal API (for CoA disconnect, etc.)
 	DjangoBaseURL      string `envconfig:"DJANGO_BASE_URL" default:"http://flash-api:8000"`
@@ -112,6 +122,23 @@ func (c *Config) Validate() error {
 		}
 		if c.PaynowReturnURL == "" {
 			errs = append(errs, "PAYNOW_RETURN_URL is required when Paynow is configured")
+		}
+	}
+	
+	// EcoCash: enabled only when any credential is set
+	ecocashConfigured := c.EcoCashAPIKey != "" || c.EcoCashMerchantCode != "" || c.EcoCashMerchantNumber != ""
+	if ecocashConfigured {
+		if c.EcoCashAPIKey == "" {
+			errs = append(errs, "ECOCASH_API_KEY is required when EcoCash is configured")
+		}
+		if c.EcoCashMerchantCode == "" {
+			errs = append(errs, "ECOCASH_MERCHANT_CODE is required when EcoCash is configured")
+		}
+		if c.EcoCashMerchantPin == "" {
+			errs = append(errs, "ECOCASH_MERCHANT_PIN is required when EcoCash is configured")
+		}
+		if c.EcoCashMerchantNumber == "" {
+			errs = append(errs, "ECOCASH_MERCHANT_NUMBER is required when EcoCash is configured")
 		}
 	}
 	
