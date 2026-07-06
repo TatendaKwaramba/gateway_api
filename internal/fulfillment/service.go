@@ -33,6 +33,7 @@ type FulfillRequest struct {
 	Amount           int64  // minor currency units
 	Currency         string
 	PlanID           int64
+	DurationDays     int
 	CustomerPhone    string
 	CustomerEmail    string
 	FulfillmentKind  string

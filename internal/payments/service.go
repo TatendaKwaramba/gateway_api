@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -62,6 +63,7 @@ type InitiateRequest struct {
 	Amount           int64             `json:"amount"` // minor currency units (cents)
 	Currency         string            `json:"currency"`
 	PlanID           *int64            `json:"plan_id,omitempty"`
+	DurationDays     *int64            `json:"duration_days,omitempty"`
 	CustomerEmail    string            `json:"customer_email,omitempty"`
 	CustomerPhone    string            `json:"customer_phone,omitempty"`
 	CustomerID       *int64            `json:"customer_id,omitempty"`
@@ -147,6 +149,14 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 	var planID interface{}
 	if req.PlanID != nil {
 		planID = *req.PlanID
+	}
+
+	// Persist duration_days in metadata so triggerFulfillment can read it back
+	if req.DurationDays != nil {
+		if req.Metadata == nil {
+			req.Metadata = make(map[string]string)
+		}
+		req.Metadata["duration_days"] = fmt.Sprintf("%d", *req.DurationDays)
 	}
 
 	// Serialize metadata to JSON for gateway_response storage
@@ -697,6 +707,7 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 	amountCents := int64(amountFloat * 100)
 
 	var nasIP, nasID, referralCode string
+	var durationDays int
 	if gatewayResponse.Valid && gatewayResponse.String != "" {
 		var meta map[string]interface{}
 		if json.Unmarshal([]byte(gatewayResponse.String), &meta) == nil {
@@ -709,6 +720,11 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 			if v, ok := meta["referral_code"].(string); ok {
 				referralCode = v
 			}
+			if v, ok := meta["duration_days"].(string); ok {
+				if d, err := strconv.Atoi(v); err == nil {
+					durationDays = d
+				}
+			}
 		}
 	}
 
@@ -717,6 +733,7 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 		TransactionIDStr: transactionIDStr,
 		Amount:           amountCents,
 		Currency:         currency,
+		DurationDays:     durationDays,
 		CustomerPhone:    customerPhone,
 		CustomerEmail:    customerEmail,
 		FulfillmentKind:  fulfillmentKind,

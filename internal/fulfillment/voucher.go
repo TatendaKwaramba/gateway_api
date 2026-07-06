@@ -56,12 +56,18 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 			&tariffPlan.MaxSessions,
 			&tariffPlan.Price,
 		)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return nil, fmt.Errorf("fulfillment: no tariff plan found for price %d (minor units)", req.Amount)
-			}
-			return nil, fmt.Errorf("fulfillment: failed to query tariff plan: %w", err)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("fulfillment: no tariff plan found for price %d (minor units)", req.Amount)
 		}
+		return nil, fmt.Errorf("fulfillment: failed to query tariff plan: %w", err)
+	}
+	}
+
+	// When duration_days is provided (dynamic hotspot pricing), override the
+	// plan's seconds with the requested duration.
+	if req.DurationDays > 0 {
+		tariffPlan.Seconds = req.DurationDays * 86400
 	}
 
 	pin, err := generatePIN()
