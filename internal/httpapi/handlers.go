@@ -47,7 +47,8 @@ func (r *Router) listSubscriptionPlans(w http.ResponseWriter, req *http.Request)
 
 // listGateways returns available payment gateways with fees
 func (r *Router) listGateways(w http.ResponseWriter, req *http.Request) {
-	gateways, err := r.paymentService.ListGateways(req.Context())
+	currency := req.URL.Query().Get("currency")
+	gateways, err := r.paymentService.ListGateways(req.Context(), currency)
 	if err != nil {
 		slog.Error("failed to list gateways", slog.Any("error", err))
 		respondJSON(w, http.StatusOK, map[string]interface{}{

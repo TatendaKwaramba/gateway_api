@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/freeradius/payments-api/internal/django"
@@ -368,6 +369,8 @@ type GetStatusResponse struct {
 	CustomerEmail     string            `json:"customer_email,omitempty"`
 	CustomerPhone     string            `json:"customer_phone,omitempty"`
 	GatewayResponse   map[string]interface{} `json:"gateway_response,omitempty"`
+	Username          string            `json:"username,omitempty"`
+	Password          string            `json:"password,omitempty"`
 	CreatedAt         time.Time         `json:"created_at"`
 	UpdatedAt         time.Time         `json:"updated_at"`
 }
@@ -435,6 +438,23 @@ func (s *Service) getTransactionResponse(ctx context.Context, transactionID int6
 	resp.VoucherPIN = voucherPin.Value()
 	resp.CustomerEmail = customerEmail.Value()
 	resp.CustomerPhone = customerPhone.Value()
+	
+	// For subscription transactions, resolve PPPoE credentials from authentication_customer.
+	// The voucher_pin is stored as "sub:<customer_id>" — the actual RADIUS username/password
+	// is the customer_id value (same for both, written to radcheck as Cleartext-Password).
+	if strings.HasPrefix(resp.VoucherPIN, "sub:") {
+		var customerUsername string
+		err := s.db.QueryRowContext(ctx, `
+			SELECT ac.customer_id
+			FROM payments_paymenttransaction t
+			JOIN authentication_customer ac ON ac.id = t.customer_id
+			WHERE t.id = ?
+		`, transactionID).Scan(&customerUsername)
+		if err == nil && customerUsername != "" {
+			resp.Username = customerUsername
+			resp.Password = customerUsername
+		}
+	}
 	
 	return &resp, nil
 }
@@ -1196,17 +1216,28 @@ type Gateway struct {
 }
 
 // ListGateways returns active payment gateways with their fee structures
-func (s *Service) ListGateways(ctx context.Context) ([]*Gateway, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT 
-			id, gateway_code,
-			name,
-			description,
-			configuration
-		FROM payments_paymentgateway
-		WHERE is_active = 1
-		ORDER BY name ASC
-	`)
+func (s *Service) ListGateways(ctx context.Context, currency string) ([]*Gateway, error) {
+	query := `
+		SELECT DISTINCT
+			pg.id, pg.gateway_code,
+			pg.name,
+			pg.description,
+			pg.configuration
+		FROM payments_paymentgateway pg
+	`
+	var args []interface{}
+	if currency != "" {
+		query += `
+			JOIN payments_gatewaysupportedcurrency gsc ON gsc.gateway_id = pg.id AND gsc.is_active = 1
+			JOIN services_supportedcurrency sc ON sc.id = gsc.currency_id AND sc.code = ? AND sc.is_active = 1
+		`
+		args = append(args, currency)
+	}
+	query += `
+		WHERE pg.is_active = 1
+		ORDER BY pg.name ASC
+	`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query gateways: %w", err)
 	}
