@@ -83,6 +83,10 @@ func (r *Router) Setup() chi.Router {
 		// Payment methods (filtered by gateway)
 		api.Get("/payments/methods", r.listPaymentMethods)
 		
+		// Subscription management
+		api.Post("/payments/subscriptions/{subscription_id}/adjust", r.adjustSubscription)
+		api.Get("/payments/subscriptions/{subscription_id}", r.getSubscription)
+
 		// Payment initiation
 		api.Post("/payments/initiate", r.initiatePayment)
 		

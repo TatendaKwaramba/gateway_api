@@ -1509,3 +1509,148 @@ func (s *Service) logWebhook(ctx context.Context, gatewayCode string, event gate
 	`, gatewayCode, rawBody, headersJSON, signatureValid, true, "", transactionID, event.ExternalReference)
 	return err
 }
+
+// SubscriptionInfo is the response from GetSubscription.
+type SubscriptionInfo struct {
+	ID             int64   `json:"id"`
+	CustomerID     int64   `json:"customer_id"`
+	PlanID         int64   `json:"plan_id"`
+	PlanName       string  `json:"plan_name"`
+	PriceMinor     int64   `json:"price_minor"`
+	Currency       string  `json:"currency"`
+	DownloadSpeed  int     `json:"download_speed"`
+	UploadSpeed    int     `json:"upload_speed"`
+	Status         string  `json:"status"`
+	StartDate      string  `json:"start_date"`
+	EndDate        string  `json:"end_date"`
+	AutoRenew      bool    `json:"auto_renew"`
+	DaysRemaining  int     `json:"days_remaining"`
+}
+
+// GetSubscription returns the current subscription details for a given ID.
+func (s *Service) GetSubscription(ctx context.Context, subscriptionID int64) (*SubscriptionInfo, error) {
+	var info SubscriptionInfo
+	var endDate sql.NullTime
+	err := s.db.QueryRowContext(ctx, `
+		SELECT s.id, s.customer_id, s.plan_id, sp.name, sp.price_minor, sp.currency,
+		       sp.download_speed, sp.upload_speed, s.status, s.start_date, s.end_date,
+		       s.auto_renew
+		FROM subscriptions_subscription s
+		JOIN services_subscriptionplan sp ON sp.id = s.plan_id
+		WHERE s.id = ?
+	`, subscriptionID).Scan(
+		&info.ID, &info.CustomerID, &info.PlanID, &info.PlanName, &info.PriceMinor,
+		&info.Currency, &info.DownloadSpeed, &info.UploadSpeed, &info.Status,
+		&info.StartDate, &endDate, &info.AutoRenew,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("subscription %d not found", subscriptionID)
+		}
+		return nil, fmt.Errorf("query subscription: %w", err)
+	}
+	if endDate.Valid {
+		info.EndDate = endDate.Time.Format("2006-01-02T15:04:05Z")
+		days := endDate.Time.Sub(time.Now()).Hours() / 24
+		if days < 0 {
+			days = 0
+		}
+		info.DaysRemaining = int(days)
+	}
+	return &info, nil
+}
+
+// AdjustmentQuote is the response from CalculateAdjustment.
+type AdjustmentQuote struct {
+	SubscriptionID  int64             `json:"subscription_id"`
+	OldPlan         PlanInfo          `json:"old_plan"`
+	NewPlan         PlanInfo          `json:"new_plan"`
+	ProrationCredit float64           `json:"proration_credit"`
+	ProrationCharge float64           `json:"proration_charge"`
+	NetAmount       float64           `json:"net_amount"`
+	DaysRemaining   int               `json:"days_remaining"`
+	BillingDays     int               `json:"billing_days"`
+}
+
+// PlanInfo is a summary of a subscription plan.
+type PlanInfo struct {
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	PriceMinor    int64  `json:"price_minor"`
+	Currency      string `json:"currency"`
+	DownloadSpeed int    `json:"download_speed"`
+	UploadSpeed   int    `json:"upload_speed"`
+}
+
+// CalculateAdjustment computes proration for a subscription plan change.
+func (s *Service) CalculateAdjustment(ctx context.Context, subscriptionID, newPlanID int64) (*AdjustmentQuote, error) {
+	// Fetch current subscription
+	var currentPlanID int64
+	var startDate, endDate time.Time
+	var status string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT plan_id, start_date, end_date, status
+		FROM subscriptions_subscription
+		WHERE id = ?
+	`, subscriptionID).Scan(&currentPlanID, &startDate, &endDate, &status)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("subscription %d not found", subscriptionID)
+		}
+		return nil, fmt.Errorf("query subscription: %w", err)
+	}
+	if status != "active" {
+		return nil, fmt.Errorf("subscription is %s, only active subscriptions can be adjusted", status)
+	}
+
+	// Fetch old plan
+	var oldPlan PlanInfo
+	err = s.db.QueryRowContext(ctx, `
+		SELECT id, name, price_minor, currency, download_speed, upload_speed
+		FROM services_subscriptionplan WHERE id = ?
+	`, currentPlanID).Scan(&oldPlan.ID, &oldPlan.Name, &oldPlan.PriceMinor, &oldPlan.Currency, &oldPlan.DownloadSpeed, &oldPlan.UploadSpeed)
+	if err != nil {
+		return nil, fmt.Errorf("query old plan: %w", err)
+	}
+
+	// Fetch new plan
+	var newPlan PlanInfo
+	err = s.db.QueryRowContext(ctx, `
+		SELECT id, name, price_minor, currency, download_speed, upload_speed
+		FROM services_subscriptionplan WHERE id = ? AND is_active = TRUE
+	`, newPlanID).Scan(&newPlan.ID, &newPlan.Name, &newPlan.PriceMinor, &newPlan.Currency, &newPlan.DownloadSpeed, &newPlan.UploadSpeed)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("new plan %d not found or inactive", newPlanID)
+		}
+		return nil, fmt.Errorf("query new plan: %w", err)
+	}
+
+	// Calculate proration
+	billingDays := int(endDate.Sub(startDate).Hours() / 24)
+	if billingDays <= 0 {
+		billingDays = 30
+	}
+	daysRemaining := int(time.Until(endDate).Hours() / 24)
+	if daysRemaining < 0 {
+		daysRemaining = 0
+	}
+
+	credit := float64(oldPlan.PriceMinor) * float64(daysRemaining) / float64(billingDays)
+	charge := float64(newPlan.PriceMinor) * float64(daysRemaining) / float64(billingDays)
+	net := charge - credit
+	if net < 0 {
+		net = 0 // No refund, just credit toward new plan
+	}
+
+	return &AdjustmentQuote{
+		SubscriptionID:  subscriptionID,
+		OldPlan:         oldPlan,
+		NewPlan:         newPlan,
+		ProrationCredit: credit,
+		ProrationCharge: charge,
+		NetAmount:       net,
+		DaysRemaining:   daysRemaining,
+		BillingDays:     billingDays,
+	}, nil
+}

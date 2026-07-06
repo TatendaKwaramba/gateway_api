@@ -624,3 +624,54 @@ func (r *Router) deliverMockWebhook(ctx context.Context, adapter *mock.Adapter, 
 
 	return r.paymentService.ProcessWebhook(ctx, "mock", event, body, headers)
 }
+
+// adjustSubscriptionRequest is the body for POST /api/subscriptions/{id}/adjust
+type adjustSubscriptionRequest struct {
+	NewPlanID int64 `json:"new_plan_id"`
+}
+
+// adjustSubscription calculates proration and initiates a payment for the difference.
+func (r *Router) adjustSubscription(w http.ResponseWriter, req *http.Request) {
+	subIDStr := chi.URLParam(req, "subscription_id")
+	subscriptionID, err := strconv.ParseInt(subIDStr, 10, 64)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "invalid subscription_id")
+		return
+	}
+
+	var body adjustSubscriptionRequest
+	if err := parseJSON(req, &body); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if body.NewPlanID <= 0 {
+		respondError(w, http.StatusBadRequest, "new_plan_id is required")
+		return
+	}
+
+	result, err := r.paymentService.CalculateAdjustment(req.Context(), subscriptionID, body.NewPlanID)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, result)
+}
+
+// getSubscription returns the current subscription details.
+func (r *Router) getSubscription(w http.ResponseWriter, req *http.Request) {
+	subIDStr := chi.URLParam(req, "subscription_id")
+	subscriptionID, err := strconv.ParseInt(subIDStr, 10, 64)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "invalid subscription_id")
+		return
+	}
+
+	result, err := r.paymentService.GetSubscription(req.Context(), subscriptionID)
+	if err != nil {
+		respondError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, result)
+}
