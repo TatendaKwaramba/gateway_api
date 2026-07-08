@@ -152,10 +152,10 @@ CREATE TABLE IF NOT EXISTS payments_paymentwebhooklog (
 
 CREATE TABLE IF NOT EXISTS payments_idempotency_key (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    `key` VARCHAR(255) NOT NULL UNIQUE,
+    idempotency_key_value VARCHAR(255) NOT NULL UNIQUE,
     request_hash VARCHAR(64) NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_key (`key`)
+    INDEX idx_key (idempotency_key_value)
 );
 
 CREATE TABLE IF NOT EXISTS payments_webhook_replay_log (

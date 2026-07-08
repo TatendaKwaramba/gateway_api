@@ -42,6 +42,38 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 			}
 			return nil, fmt.Errorf("fulfillment: failed to query tariff plan: %w", err)
 		}
+	} else if req.DurationDays > 0 {
+		// Dynamic hotspot pricing — no static plan matches the computed price.
+		// Use the first available active plan for speed/session defaults, then
+		// override seconds below with duration_days.
+		err := s.db.QueryRowContext(ctx, `
+			SELECT id, seconds, download_speed, upload_speed, max_sessions, price
+			FROM services_tariffplan
+			WHERE is_active = TRUE
+			LIMIT 1
+		`).Scan(
+			&tariffPlan.ID,
+			&tariffPlan.Seconds,
+			&tariffPlan.DownloadSpeed,
+			&tariffPlan.UploadSpeed,
+			&tariffPlan.MaxSessions,
+			&tariffPlan.Price,
+		)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				// No plans at all — use sensible defaults for a hotspot voucher.
+				tariffPlan = struct {
+					ID            int64
+					Seconds       int
+					DownloadSpeed int
+					UploadSpeed   int
+					MaxSessions   int
+					Price         int64
+				}{ID: 0, Seconds: 86400, DownloadSpeed: 3000, UploadSpeed: 1500, MaxSessions: 2, Price: req.Amount}
+			} else {
+				return nil, fmt.Errorf("fulfillment: failed to query tariff plan: %w", err)
+			}
+		}
 	} else {
 		err := s.db.QueryRowContext(ctx, `
 			SELECT id, seconds, download_speed, upload_speed, max_sessions, price
@@ -56,12 +88,12 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 			&tariffPlan.MaxSessions,
 			&tariffPlan.Price,
 		)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("fulfillment: no tariff plan found for price %d (minor units)", req.Amount)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return nil, fmt.Errorf("fulfillment: no tariff plan found for price %d (minor units)", req.Amount)
+			}
+			return nil, fmt.Errorf("fulfillment: failed to query tariff plan: %w", err)
 		}
-		return nil, fmt.Errorf("fulfillment: failed to query tariff plan: %w", err)
-	}
 	}
 
 	// When duration_days is provided (dynamic hotspot pricing), override the
@@ -149,13 +181,17 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 		return nil, fmt.Errorf("fulfillment: failed to lookup radcheck id: %w", err)
 	}
 
+	var tariffPlanID interface{} = tariffPlan.ID
+	if tariffPlan.ID == 0 {
+		tariffPlanID = nil
+	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO vouchers_voucher (
 			radcheck_id, tariff_plan_id, voucher_amount, voucher_serial_number,
 			voucher_pin, voucher_expired_date, voucher_response_message, voucher_status,
 			payment_transaction_id, created_by_id, updated_by_id, created_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 1, 1, NOW(), NOW())
-	`, radcheckID, tariffPlan.ID, tariffPlan.Price, pin, pin, timeLimit, "Payment voucher", req.TransactionID)
+	`, radcheckID, tariffPlanID, tariffPlan.Price, pin, pin, timeLimit, "Payment voucher", req.TransactionID)
 	if err != nil {
 		return nil, fmt.Errorf("fulfillment: failed to insert voucher: %w", err)
 	}

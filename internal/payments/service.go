@@ -1169,8 +1169,8 @@ func (s *Service) ListPaymentMethods(ctx context.Context, gatewayCode string) ([
 			pg.gateway_code,
 			pm.method_code,
 			pm.display_name,
-			JSON_EXTRACT(pm.metadata, '$.requires_phone') = 'true' as requires_phone,
-			JSON_EXTRACT(pm.metadata, '$.requires_redirect') = 'true' as requires_redirect
+			CAST(JSON_EXTRACT(pm.metadata, '$.requires_phone') AS CHAR) = 'true' as requires_phone,
+			CAST(JSON_EXTRACT(pm.metadata, '$.requires_redirect') AS CHAR) = 'true' as requires_redirect
 		FROM payments_paymentmethod pm
 		JOIN payments_paymentgateway pg ON pm.gateway_id = pg.id
 		WHERE pm.is_active = 1 AND pg.is_active = 1
@@ -1299,7 +1299,14 @@ func (s *Service) ListGateways(ctx context.Context, currency string) ([]*Gateway
 			}
 		}
 		g.IsActive = true
-		gateways = append(gateways, &g)
+		// Only include gateways that have a registered adapter in the Go registry.
+		// DB may list gateways whose credentials aren't configured, but those
+		// cannot actually process payments.
+		if _, ok := s.registry.Resolve(g.Code); ok {
+			gateways = append(gateways, &g)
+		} else {
+			slog.Debug("skipping gateway (adapter not registered)", slog.String("code", g.Code))
+		}
 	}
 
 	if err := rows.Err(); err != nil {

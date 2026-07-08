@@ -70,6 +70,19 @@ func main() {
 			slog.Error("failed to register mock gateway", slog.Any("error", err))
 			os.Exit(1)
 		}
+
+		// In dev mode, register a mock adapter for the ecocash gateway when real
+		// EcoCash credentials aren't configured. This lets the customer app show
+		// and test the full EcoCash checkout flow.
+		if cfg.EcoCashAPIKey == "" || cfg.EcoCashMerchantCode == "" {
+			slog.Info("registering mock adapter for ecocash gateway (dev mode)")
+			ecocashMock := mock.NewAdapterWithCode("ecocash", cfg.MockGatewayWebhookSecret, cfg.MockReturnURL)
+			ecocashMock.SetWebhookBaseURL(fmt.Sprintf("http://localhost:%d", cfg.Port))
+			if err := registry.Register(ecocashMock); err != nil {
+				slog.Error("failed to register mock ecocash adapter", slog.Any("error", err))
+				os.Exit(1)
+			}
+		}
 	}
 
 	// Register Paynow gateway if credentials are configured

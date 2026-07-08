@@ -33,6 +33,7 @@ const (
 
 // Adapter implements the gateways.Gateway interface for testing
 type Adapter struct {
+	code           string
 	webhookSecret  string
 	returnURL      string
 	webhookBaseURL string
@@ -53,12 +54,19 @@ type Transaction struct {
 	WebhookURL        string
 }
 
-// NewAdapter creates a new mock gateway adapter
+// NewAdapter creates a new mock gateway adapter with the default "mock" code.
 func NewAdapter(webhookSecret, returnURL string) *Adapter {
+	return NewAdapterWithCode(GatewayCode, webhookSecret, returnURL)
+}
+
+// NewAdapterWithCode creates a mock gateway adapter with a custom gateway code.
+// This allows simulating other gateway workflows (e.g., "ecocash") during development.
+func NewAdapterWithCode(code, webhookSecret, returnURL string) *Adapter {
 	return &Adapter{
+		code:         code,
 		webhookSecret: webhookSecret,
-		returnURL:     returnURL,
-		transactions:  make(map[string]*Transaction),
+		returnURL:    returnURL,
+		transactions: make(map[string]*Transaction),
 	}
 }
 
@@ -70,7 +78,7 @@ func (a *Adapter) SetWebhookBaseURL(baseURL string) {
 
 // Code returns the gateway code
 func (a *Adapter) Code() string {
-	return GatewayCode
+	return a.code
 }
 
 // Capabilities returns what this gateway supports
@@ -86,13 +94,22 @@ func (a *Adapter) Capabilities() gateways.Capabilities {
 
 // SupportedMethods returns available payment methods
 func (a *Adapter) SupportedMethods() []gateways.Method {
-	return []gateways.Method{
+	methods := []gateways.Method{
 		{Code: MethodInstant, DisplayName: "Mock Instant", RequiresPhone: false, RequiresRedirect: false},
 		{Code: MethodEcoCash, DisplayName: "Mock EcoCash", RequiresPhone: true, RequiresRedirect: false},
 		{Code: MethodCardRedirect, DisplayName: "Mock Card (Redirect)", RequiresPhone: false, RequiresRedirect: true},
 		{Code: MethodSlow, DisplayName: "Mock Slow", RequiresPhone: true, RequiresRedirect: false},
 		{Code: MethodFlaky, DisplayName: "Mock Flaky", RequiresPhone: true, RequiresRedirect: false},
 	}
+	// When emulating the ecocash gateway, expose the real method code so the
+	// customer app's method picker (which queries the DB) finds a matching adapter.
+	if a.code == "ecocash" {
+		methods = append(methods, gateways.Method{
+			Code: "ecocash-ecocash", DisplayName: "EcoCash",
+			RequiresPhone: true, RequiresRedirect: false,
+		})
+	}
+	return methods
 }
 
 // SupportedCurrencies returns supported currencies
@@ -382,7 +399,7 @@ func (a *Adapter) deliverWebhook(tx *Transaction, state, eventType string) {
 	timestamp := fmt.Sprintf("%d", time.Now().Unix())
 	sig := a.computeSignature(timestamp, body)
 	
-	webhookURL := fmt.Sprintf("%s/webhooks/mock", a.webhookBaseURL)
+	webhookURL := fmt.Sprintf("%s/webhooks/%s", a.webhookBaseURL, a.code)
 	req, err := http.NewRequest(http.MethodPost, webhookURL, strings.NewReader(string(body)))
 	if err != nil {
 		return
