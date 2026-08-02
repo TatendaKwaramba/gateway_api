@@ -3,6 +3,7 @@ package metrics
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -97,6 +98,32 @@ var (
 		},
 		[]string{"provider", "status"},
 	)
+
+	// HTTP request metrics
+	httpRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "payments_http_requests_total",
+			Help: "Total HTTP requests to payments API",
+		},
+		[]string{"method", "endpoint", "status"},
+	)
+
+	httpRequestDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "payments_http_request_duration_seconds",
+			Help:    "HTTP request duration in seconds",
+			Buckets: []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0},
+		},
+		[]string{"method", "endpoint"},
+	)
+
+	httpRequestsInProgress = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "payments_http_requests_in_progress",
+			Help: "Number of HTTP requests currently being processed",
+		},
+		[]string{"method", "endpoint"},
+	)
 )
 
 // RecordPaymentInitiated increments the initiated counter
@@ -147,6 +174,22 @@ func RecordPollerRun(transactionsChecked int) {
 // RecordNotificationAttempt records a notification attempt
 func RecordNotificationAttempt(provider, status string) {
 	notificationAttemptsTotal.WithLabelValues(provider, status).Inc()
+}
+
+// RecordHTTPRequest records an HTTP request
+func RecordHTTPRequest(method, endpoint, status string, duration time.Duration) {
+	httpRequestsTotal.WithLabelValues(method, endpoint, status).Inc()
+	httpRequestDuration.WithLabelValues(method, endpoint).Observe(duration.Seconds())
+}
+
+// IncHTTPRequestInProgress increments the in-progress counter
+func IncHTTPRequestInProgress(method, endpoint string) {
+	httpRequestsInProgress.WithLabelValues(method, endpoint).Inc()
+}
+
+// DecHTTPRequestInProgress decrements the in-progress counter
+func DecHTTPRequestInProgress(method, endpoint string) {
+	httpRequestsInProgress.WithLabelValues(method, endpoint).Dec()
 }
 
 // Handler returns an HTTP handler for the /metrics endpoint

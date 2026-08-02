@@ -62,12 +62,13 @@ func (r *Router) Setup() chi.Router {
 	router.Use(middleware.Recoverer)
 	router.Use(middleware.Timeout(30 * time.Second))
 	router.Use(JSONContentType)
+	router.Use(MetricsMiddleware)
 	
 	// Health check
 	router.Get("/health", r.healthHandler)
 	
 	// Prometheus metrics
-	router.Get("/metrics", metrics.Handler().ServeHTTP)
+	router.Get("/metrics", MetricsHandler().ServeHTTP)
 	
 	// Public API (rate-limited in production)
 	router.Route("/api", func(api chi.Router) {
