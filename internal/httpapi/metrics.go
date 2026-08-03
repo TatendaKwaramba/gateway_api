@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/freeradius/payments_api/internal/metrics"
+	"github.com/freeradius/payments-api/internal/metrics"
 )
 
 // normalizeEndpoint normalizes URL path for metrics grouping

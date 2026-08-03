@@ -8,7 +8,6 @@ import (
 
 	"github.com/freeradius/payments-api/internal/gateways"
 	"github.com/freeradius/payments-api/internal/gateways/mock"
-	"github.com/freeradius/payments-api/internal/metrics"
 	"github.com/freeradius/payments-api/internal/payments"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
