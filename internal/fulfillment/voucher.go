@@ -187,11 +187,11 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO vouchers_voucher (
-			radcheck_id, tariff_plan_id, voucher_amount, voucher_serial_number,
+			radcheck_id, tariff_plan_id, customer_id, voucher_amount, voucher_serial_number,
 			voucher_pin, voucher_expired_date, voucher_response_message, voucher_status,
 			payment_transaction_id, created_by_id, updated_by_id, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 1, 1, NOW(), NOW())
-	`, radcheckID, tariffPlanID, tariffPlan.Price, pin, pin, timeLimit, "Payment voucher", req.TransactionID)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, 1, NOW(), NOW())
+	`, radcheckID, tariffPlanID, customerID, tariffPlan.Price, pin, pin, timeLimit, "Payment voucher", req.TransactionID)
 	if err != nil {
 		return nil, fmt.Errorf("fulfillment: failed to insert voucher: %w", err)
 	}
@@ -376,7 +376,7 @@ func (s *Service) ensureVoucherCustomer(
 		INSERT INTO authentication_customer (
 			customer_id, customer_type, customer_name, customer_email, customer_phone,
 			customer_address, customer_city, organization_id, referred_by_id, is_active, created_at, updated_at
-		) VALUES (?, 'individual', ?, ?, ?, 'Payment voucher', 'N/A', ?, ?, TRUE, NOW(), NOW())
+		) VALUES (?, 'voucher', ?, ?, ?, 'Payment voucher', 'N/A', ?, ?, TRUE, NOW(), NOW())
 	`, fmt.Sprintf("voucher-%d", req.TransactionID), pin, email, req.CustomerPhone, orgVal, referredByVal)
 	if err != nil {
 		return 0, fmt.Errorf("fulfillment: create voucher customer: %w", err)

@@ -251,7 +251,7 @@ func (s *Service) resolveOrCreateCustomer(ctx context.Context, req FulfillReques
 		INSERT INTO authentication_customer (
 			customer_id, customer_type, customer_name, customer_email, customer_phone,
 			customer_address, customer_city, customer_password, organization_id, referred_by_id, is_active, created_at, updated_at
-		) VALUES (?, 'individual', ?, ?, ?, 'Online checkout', 'N/A', ?, ?, ?, TRUE, NOW(), NOW())
+		) VALUES (?, 'subscriber', ?, ?, ?, 'Online checkout', 'N/A', ?, ?, ?, TRUE, NOW(), NOW())
 	`, customerCode, username, req.CustomerEmail, req.CustomerPhone, username, orgVal, referredByVal)
 	if err != nil {
 		return 0, fmt.Errorf("fulfillment: create customer: %w", err)

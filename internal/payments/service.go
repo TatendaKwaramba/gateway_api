@@ -942,7 +942,7 @@ func (s *Service) validatePlanAmount(ctx context.Context, planID, amount int64, 
 		var price int64
 		var planCurrency string
 		err := s.db.QueryRowContext(ctx, `
-			SELECT price_minor, COALESCE(currency, ?) FROM services_subscriptionplan
+			SELECT price_minor, COALESCE(currency, ?) FROM billing_billingplan
 			WHERE id = ? AND is_active = 1
 		`, s.defaultCurrency, planID).Scan(&price, &planCurrency)
 		if err == sql.ErrNoRows {
@@ -1035,19 +1035,21 @@ func (s *Service) ListPlans(ctx context.Context) ([]*Plan, error) {
 	return plans, nil
 }
 
-// ListSubscriptionPlans returns all active subscription plans ordered by price
+// ListSubscriptionPlans returns all active billing plans ordered by price
 func (s *Service) ListSubscriptionPlans(ctx context.Context) ([]*Plan, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sp.id, sp.name,
-			sp.price_minor, COALESCE(sp.currency, ?),
-			sp.billing_period_days,
-			sp.download_speed, sp.upload_speed, sp.max_sessions,
-			COALESCE(sp.fup_data_quota_mb, 0),
-			COALESCE(sp.fup_download_speed, 0),
-			COALESCE(sp.fup_upload_speed, 0)
-		FROM services_subscriptionplan sp
-		WHERE sp.is_active = 1
-		ORDER BY sp.price_minor ASC
+		SELECT bp.id, bp.name,
+			bp.price_minor, COALESCE(bp.currency, ?),
+			COALESCE(bp.billing_cycle_id, 0),
+			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.download_speed'), 0),
+			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.upload_speed'), 0),
+			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.max_sessions'), 1),
+			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.fup_data_quota_mb'), 0),
+			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.fup_download_speed'), 0),
+			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.fup_upload_speed'), 0)
+		FROM billing_billingplan bp
+		WHERE bp.is_active = 1
+		ORDER BY bp.price_minor ASC
 	`, s.defaultCurrency)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query subscription plans: %w", err)
@@ -1539,11 +1541,13 @@ func (s *Service) GetSubscription(ctx context.Context, subscriptionID int64) (*S
 	var info SubscriptionInfo
 	var endDate sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
-		SELECT s.id, s.customer_id, s.plan_id, sp.name, sp.price_minor, sp.currency,
-		       sp.download_speed, sp.upload_speed, s.status, s.start_date, s.end_date,
+		SELECT s.id, s.customer_id, s.plan_id, bp.name, bp.price_minor, bp.currency,
+		       COALESCE(JSON_EXTRACT(bp.policy_summary, '$.download_speed'), 0),
+		       COALESCE(JSON_EXTRACT(bp.policy_summary, '$.upload_speed'), 0),
+		       s.status, s.start_date, s.end_date,
 		       s.auto_renew
 		FROM subscriptions_subscription s
-		JOIN services_subscriptionplan sp ON sp.id = s.plan_id
+		JOIN billing_billingplan bp ON bp.id = s.plan_id
 		WHERE s.id = ?
 	`, subscriptionID).Scan(
 		&info.ID, &info.CustomerID, &info.PlanID, &info.PlanName, &info.PriceMinor,
@@ -1613,8 +1617,10 @@ func (s *Service) CalculateAdjustment(ctx context.Context, subscriptionID, newPl
 	// Fetch old plan
 	var oldPlan PlanInfo
 	err = s.db.QueryRowContext(ctx, `
-		SELECT id, name, price_minor, currency, download_speed, upload_speed
-		FROM services_subscriptionplan WHERE id = ?
+		SELECT id, name, price_minor, currency,
+		       COALESCE(JSON_EXTRACT(policy_summary, '$.download_speed'), 0),
+		       COALESCE(JSON_EXTRACT(policy_summary, '$.upload_speed'), 0)
+		FROM billing_billingplan WHERE id = ?
 	`, currentPlanID).Scan(&oldPlan.ID, &oldPlan.Name, &oldPlan.PriceMinor, &oldPlan.Currency, &oldPlan.DownloadSpeed, &oldPlan.UploadSpeed)
 	if err != nil {
 		return nil, fmt.Errorf("query old plan: %w", err)
@@ -1623,8 +1629,10 @@ func (s *Service) CalculateAdjustment(ctx context.Context, subscriptionID, newPl
 	// Fetch new plan
 	var newPlan PlanInfo
 	err = s.db.QueryRowContext(ctx, `
-		SELECT id, name, price_minor, currency, download_speed, upload_speed
-		FROM services_subscriptionplan WHERE id = ? AND is_active = TRUE
+		SELECT id, name, price_minor, currency,
+		       COALESCE(JSON_EXTRACT(policy_summary, '$.download_speed'), 0),
+		       COALESCE(JSON_EXTRACT(policy_summary, '$.upload_speed'), 0)
+		FROM billing_billingplan WHERE id = ? AND is_active = TRUE
 	`, newPlanID).Scan(&newPlan.ID, &newPlan.Name, &newPlan.PriceMinor, &newPlan.Currency, &newPlan.DownloadSpeed, &newPlan.UploadSpeed)
 	if err != nil {
 		if err == sql.ErrNoRows {

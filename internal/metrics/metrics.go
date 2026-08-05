@@ -49,9 +49,11 @@ var (
 	// fulfillmentDurationSeconds tracks fulfillment latency
 	fulfillmentDurationSeconds = promauto.NewHistogram(
 		prometheus.HistogramOpts{
-			Name:    "fulfillment_duration_seconds",
-			Help:    "Duration of fulfillment operations in seconds",
-			Buckets: prometheus.DefBuckets,
+			Name: "fulfillment_duration_seconds",
+			Help: "Duration of fulfillment operations in seconds",
+			// Extend beyond prometheus.DefBuckets (max 10s) so the 60s
+			// fulfillment latency SLO (docs/operations/sli-slo.md SLO-2) is resolvable.
+			Buckets: []float64{1, 5, 10, 30, 60, 120, 300},
 		},
 	)
 
