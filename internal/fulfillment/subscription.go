@@ -2,13 +2,31 @@ package fulfillment
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"time"
 
 	"github.com/freeradius/payments-api/internal/metrics"
 )
+
+// generateSubscriberPassword creates a 16-char alphanumeric password for PPPoE.
+// Unlike voucher PINs (numeric only), subscriber passwords include letters for
+// MS-CHAPv2 compatibility and stronger security.
+func generateSubscriberPassword() (string, error) {
+	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 16)
+	for i := range b {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(chars))))
+		if err != nil {
+			return "", err
+		}
+		b[i] = chars[n.Int64()]
+	}
+	return string(b), nil
+}
 
 func (s *Service) fulfillSubscription(ctx context.Context, req FulfillRequest) (*FulfillResult, error) {
 	if req.PlanID <= 0 {
@@ -23,11 +41,12 @@ func (s *Service) fulfillSubscription(ctx context.Context, req FulfillRequest) (
 		UploadSpeed       int
 		PriceMinor        int64
 		DefaultPoolID     sql.NullInt64
+		VlanID            sql.NullInt64
 	}
 
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, name, billing_period_days, download_speed, upload_speed,
-		       price_minor, default_framed_ip_pool_id
+		       price_minor, default_framed_ip_pool_id, vlan_id
 		FROM services_subscriptionplan
 		WHERE id = ? AND is_active = TRUE
 	`, req.PlanID).Scan(
@@ -38,6 +57,7 @@ func (s *Service) fulfillSubscription(ctx context.Context, req FulfillRequest) (
 		&plan.UploadSpeed,
 		&plan.PriceMinor,
 		&plan.DefaultPoolID,
+		&plan.VlanID,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -96,12 +116,27 @@ func (s *Service) fulfillSubscription(ctx context.Context, req FulfillRequest) (
 	if err != nil {
 		return nil, fmt.Errorf("fulfillment: clear radcheck password: %w", err)
 	}
+
+	subPassword, err := generateSubscriberPassword()
+	if err != nil {
+		return nil, fmt.Errorf("fulfillment: generate subscriber password: %w", err)
+	}
+
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO radcheck (username, attribute, op, value)
 		VALUES (?, 'Cleartext-Password', ':=', ?)
-	`, customerUsername, customerUsername)
+	`, customerUsername, subPassword)
 	if err != nil {
 		return nil, fmt.Errorf("fulfillment: upsert radcheck password: %w", err)
+	}
+
+	// Store password in customer record so Beta App can display it
+	_, err = tx.ExecContext(ctx, `
+		UPDATE authentication_customer SET customer_password = ? WHERE customer_id = ?
+	`, subPassword, customerUsername)
+	if err != nil {
+		slog.Warn("fulfillment: could not store subscriber password on customer record",
+			"customer_id", customerUsername, "error", err)
 	}
 
 	// Write radreply entries for SQL authorize fallback.
@@ -144,6 +179,39 @@ func (s *Service) fulfillSubscription(ctx context.Context, req FulfillRequest) (
 				"INSERT INTO radreply (username, attribute, op, value) VALUES (?, 'Framed-Pool', '=', ?)",
 				customerUsername, poolName,
 			)
+		}
+	}
+
+	// Write radusergroup for plan-based speed tiers
+	groupName := fmt.Sprintf("plan-%d", plan.ID)
+	_, err = tx.ExecContext(ctx,
+		"DELETE FROM radusergroup WHERE username = ?", customerUsername)
+	if err != nil {
+		return nil, fmt.Errorf("fulfillment: clear radusergroup: %w", err)
+	}
+	_, err = tx.ExecContext(ctx,
+		"INSERT INTO radusergroup (username, groupname, priority) VALUES (?, ?, 1)",
+		customerUsername, groupName)
+	if err != nil {
+		return nil, fmt.Errorf("fulfillment: insert radusergroup: %w", err)
+	}
+
+	// Write VLAN Tunnel-* attributes if plan has a VLAN
+	if plan.VlanID.Valid {
+		vlanIDStr := fmt.Sprintf("%d", plan.VlanID.Int64)
+		vlanAttrs := []struct{ attr, value string }{
+			{"Tunnel-Type", "VLAN"},
+			{"Tunnel-Medium-Type", "IEEE-802"},
+			{"Tunnel-Private-Group-ID", vlanIDStr},
+		}
+		for _, a := range vlanAttrs {
+			_, err = tx.ExecContext(ctx,
+				"INSERT INTO radreply (username, attribute, op, value) VALUES (?, ?, '=', ?)",
+				customerUsername, a.attr, a.value,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("fulfillment: insert radreply %s: %w", a.attr, err)
+			}
 		}
 	}
 
@@ -250,9 +318,10 @@ func (s *Service) resolveOrCreateCustomer(ctx context.Context, req FulfillReques
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO authentication_customer (
 			customer_id, customer_type, customer_name, customer_email, customer_phone,
-			customer_address, customer_city, customer_password, organization_id, referred_by_id, is_active, created_at, updated_at
-		) VALUES (?, 'subscriber', ?, ?, ?, 'Online checkout', 'N/A', ?, ?, ?, TRUE, NOW(), NOW())
-	`, customerCode, username, req.CustomerEmail, req.CustomerPhone, username, orgVal, referredByVal)
+			customer_address, customer_city, customer_password, organization_id, referred_by_id,
+			radius_username, access_type, is_active, created_at, updated_at
+		) VALUES (?, 'subscriber', ?, ?, ?, 'Online checkout', 'N/A', ?, ?, ?, ?, 'subscription', TRUE, NOW(), NOW())
+	`, customerCode, username, req.CustomerEmail, req.CustomerPhone, username, orgVal, referredByVal, customerCode)
 	if err != nil {
 		return 0, fmt.Errorf("fulfillment: create customer: %w", err)
 	}
