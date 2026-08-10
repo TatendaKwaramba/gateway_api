@@ -32,14 +32,11 @@ func NewRouter(paymentService *payments.Service, registry *gateways.Registry, ad
 // corsMiddleware handles CORS for cross-origin requests
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Allow requests from any origin in development
-		// In production, this should be restricted to specific origins
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 
-		// Handle preflight requests
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -49,10 +46,21 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// DeprecationMiddleware adds RFC 8594 headers to deprecated unversioned endpoints
+func DeprecationMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Deprecation", "true")
+		w.Header().Set("Sunset", "Sat, 01 Aug 2027 00:00:00 GMT")
+		w.Header().Set("Link", "</api/v1"+r.URL.Path+">; rel=\"successor-version\"")
+		w.Header().Set("X-API-Version", "v1 (unversioned deprecated)")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Setup configures all routes
 func (r *Router) Setup() chi.Router {
 	router := chi.NewRouter()
-	
+
 	// Middleware
 	router.Use(corsMiddleware)
 	router.Use(middleware.RequestID)
@@ -62,63 +70,58 @@ func (r *Router) Setup() chi.Router {
 	router.Use(middleware.Timeout(30 * time.Second))
 	router.Use(JSONContentType)
 	router.Use(MetricsMiddleware)
-	
+
 	// Health check
 	router.Get("/health", r.healthHandler)
-	
+
 	// Prometheus metrics
 	router.Get("/metrics", MetricsHandler().ServeHTTP)
-	
-	// Public API (rate-limited in production)
+
+	// v1 API (canonical)
+	router.Route("/api/v1", func(v1 chi.Router) {
+		v1.Get("/plans", r.listPlans)
+		v1.Get("/subscription-plans", r.listSubscriptionPlans)
+		v1.Get("/payments/gateways", r.listGateways)
+		v1.Get("/payments/methods", r.listPaymentMethods)
+		v1.Post("/payments/subscriptions/{subscription_id}/adjust", r.adjustSubscription)
+		v1.Get("/payments/subscriptions/{subscription_id}", r.getSubscription)
+		v1.Post("/payments/initiate", r.initiatePayment)
+		v1.Get("/payments/{transaction_id}/status", r.getPaymentStatus)
+		v1.Post("/payments/{transaction_id}/poll", r.pollPaymentStatus)
+	})
+
+	// Unversioned API (deprecated - serves v1, returns deprecation headers)
 	router.Route("/api", func(api chi.Router) {
-		// Tariff plans
+		api.Use(DeprecationMiddleware)
 		api.Get("/plans", r.listPlans)
-
-		// Subscription plans
 		api.Get("/subscription-plans", r.listSubscriptionPlans)
-
-		// Payment gateways
 		api.Get("/payments/gateways", r.listGateways)
-
-		// Payment methods (filtered by gateway)
 		api.Get("/payments/methods", r.listPaymentMethods)
-		
-		// Subscription management
 		api.Post("/payments/subscriptions/{subscription_id}/adjust", r.adjustSubscription)
 		api.Get("/payments/subscriptions/{subscription_id}", r.getSubscription)
-
-		// Payment initiation
 		api.Post("/payments/initiate", r.initiatePayment)
-		
-		// Payment status
 		api.Get("/payments/{transaction_id}/status", r.getPaymentStatus)
-		
-		// Manual poll (queries gateway and updates state)
 		api.Post("/payments/{transaction_id}/poll", r.pollPaymentStatus)
 	})
-	
+
 	// Webhooks (from payment gateways)
 	router.Post("/webhooks/{gateway_code}", r.webhookHandler)
-	
-	// Admin API (authenticated)
+
+	// Admin API (authenticated - no versioning, internal)
 	router.Route("/admin/api", func(admin chi.Router) {
 		if r.adminAuth != nil {
 			admin.Use(r.adminAuth)
 		}
-
-		// Transaction management
 		admin.Get("/payments", r.adminListTransactions)
 		admin.Get("/payments/{transaction_id}", r.adminGetTransaction)
 		admin.Get("/payments/{transaction_id}/receipt", r.adminGetReceipt)
 		admin.Get("/payments/{transaction_id}/webhooks", r.adminGetTransactionWebhooks)
 		admin.Post("/payments/{transaction_id}/refund", r.adminRefund)
 		admin.Post("/payments/{transaction_id}/cancel", r.adminCancel)
-
-		// Gateway management
 		admin.Get("/gateways", r.adminListGateways)
 		admin.Get("/gateways/{gateway_code}/schema", r.adminGetGatewaySchema)
 	})
-	
+
 	// Mock gateway admin endpoints (only when mock is enabled)
 	if mockAdapter := r.getMockAdapter(); mockAdapter != nil {
 		router.Route("/api/mock", func(mock chi.Router) {
@@ -128,11 +131,9 @@ func (r *Router) Setup() chi.Router {
 			mock.Post("/transactions/{external_ref}/refund", r.mockRefundTransaction)
 			mock.Post("/transactions/{external_ref}/webhook", r.mockTriggerWebhook)
 		})
-		
-		// Mock checkout page
 		router.Get("/mock/checkout/{external_ref}", r.mockCheckoutPage)
 	}
-	
+
 	return router
 }
 
@@ -148,9 +149,6 @@ func (r *Router) getMockAdapter() *mock.Adapter {
 	if !ok {
 		return nil
 	}
-	
-	// This is a bit of a hack - in production we'd use a type assertion
-	// or have a registry method to get mock-specific interface
 	if adapter, ok := g.(*mock.Adapter); ok {
 		return adapter
 	}
@@ -186,6 +184,5 @@ func parseJSON(r *http.Request, v interface{}) error {
 }
 
 func init() {
-	// Ensure slog is set up
 	slog.SetDefault(slog.Default())
 }
