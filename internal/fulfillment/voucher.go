@@ -375,9 +375,10 @@ func (s *Service) ensureVoucherCustomer(
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO authentication_customer (
 			customer_id, customer_type, customer_name, customer_email, customer_phone,
-			customer_address, customer_city, organization_id, referred_by_id, is_active, created_at, updated_at
-		) VALUES (?, 'voucher', ?, ?, ?, 'Payment voucher', 'N/A', ?, ?, TRUE, NOW(), NOW())
-	`, fmt.Sprintf("voucher-%d", req.TransactionID), pin, email, req.CustomerPhone, orgVal, referredByVal)
+			customer_address, customer_city, organization_id, referred_by_id,
+			radius_username, access_type, is_active, created_at, updated_at
+		) VALUES (?, 'voucher', ?, ?, ?, 'Payment voucher', 'N/A', ?, ?, ?, 'hotspot', TRUE, NOW(), NOW())
+	`, fmt.Sprintf("voucher-%d", req.TransactionID), pin, email, req.CustomerPhone, orgVal, referredByVal, pin)
 	if err != nil {
 		return 0, fmt.Errorf("fulfillment: create voucher customer: %w", err)
 	}
