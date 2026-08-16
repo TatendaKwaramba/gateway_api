@@ -56,3 +56,7 @@ deps:
 deps-update:
 	go get -u ./...
 	go mod tidy
+
+# Check Go fixture DDL is in sync with Django models
+fixture-check:
+	python3 scripts/fixture_check.py
