@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -28,14 +29,14 @@ type FulfillmentService interface {
 
 // Service handles payment operations
 type Service struct {
-	db                  *sql.DB
-	registry            *gateways.Registry
-	stateMachine        *StateMachine
-	idempotencyStore    *IdempotencyStore
-	webhookReplayStore  *WebhookReplayStore
-	fulfillmentService  FulfillmentService
-	djangoClient        *django.Client
-	defaultCurrency     string
+	db                 *sql.DB
+	registry           *gateways.Registry
+	stateMachine       *StateMachine
+	idempotencyStore   *IdempotencyStore
+	webhookReplayStore *WebhookReplayStore
+	fulfillmentService FulfillmentService
+	djangoClient       *django.Client
+	defaultCurrency    string
 }
 
 // NewService creates a new payment service
@@ -57,32 +58,37 @@ func NewService(db *sql.DB, registry *gateways.Registry, fulfillmentService Fulf
 
 // InitiateRequest represents a request to initiate a payment
 type InitiateRequest struct {
-	GatewayCode      string            `json:"gateway_code"`
-	GatewayID        *int64            `json:"gateway_id,omitempty"` // F3.8: explicit org-scoped gateway
-	MethodCode       string            `json:"method_code"`
-	Amount           int64             `json:"amount"` // minor currency units (cents)
-	Currency         string            `json:"currency"`
-	PlanID           *int64            `json:"plan_id,omitempty"`
-	DurationDays     *int64            `json:"duration_days,omitempty"`
-	CustomerEmail    string            `json:"customer_email,omitempty"`
-	CustomerPhone    string            `json:"customer_phone,omitempty"`
-	CustomerID       *int64            `json:"customer_id,omitempty"`
-	FulfillmentKind  string            `json:"fulfillment_kind,omitempty"`
-	Metadata         map[string]string `json:"metadata,omitempty"`
-	IdempotencyKey   string            `json:"idempotency_key,omitempty"`
+	GatewayCode   string `json:"gateway_code"`
+	GatewayID     *int64 `json:"gateway_id,omitempty"` // F3.8: explicit org-scoped gateway
+	MethodCode    string `json:"method_code"`
+	Amount        int64  `json:"amount"` // minor currency units (cents)
+	Currency      string `json:"currency"`
+	PlanID        *int64 `json:"plan_id,omitempty"`
+	DurationDays  *int64 `json:"duration_days,omitempty"`
+	CustomerEmail string `json:"customer_email,omitempty"`
+	CustomerPhone string `json:"customer_phone,omitempty"`
+	CustomerID    *int64 `json:"customer_id,omitempty"`
+	// M-CIM: logged-in buyer identity — stamps the transaction's customer FK
+	// directly (initiate time, no digits-matching later) and auto-fills the
+	// notification contacts when the checkout form omits them.
+	OwnerCustomerID *int64            `json:"owner_customer_id,omitempty"`
+	OwnerContacts   *IdentityContact  `json:"owner_contacts,omitempty"`
+	FulfillmentKind string            `json:"fulfillment_kind,omitempty"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
+	IdempotencyKey  string            `json:"idempotency_key,omitempty"`
 }
 
 // InitiateResponse represents the response from initiating a payment
 type InitiateResponse struct {
-	TransactionID     int64             `json:"transaction_id"`
-	TransactionIDStr  string            `json:"transaction_id_str"`
-	State             string            `json:"state"`
-	GatewayCode       string            `json:"gateway_code"`
-	Amount            int64             `json:"amount"`
-	Currency          string            `json:"currency"`
-	RedirectURL       string            `json:"redirect_url,omitempty"`
-	IsReplay          bool              `json:"is_replay,omitempty"`
-	CreatedAt         time.Time         `json:"created_at"`
+	TransactionID    int64     `json:"transaction_id"`
+	TransactionIDStr string    `json:"transaction_id_str"`
+	State            string    `json:"state"`
+	GatewayCode      string    `json:"gateway_code"`
+	Amount           int64     `json:"amount"`
+	Currency         string    `json:"currency"`
+	RedirectURL      string    `json:"redirect_url,omitempty"`
+	IsReplay         bool      `json:"is_replay,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // Initiate creates a new payment transaction
@@ -116,36 +122,36 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 			return nil, err
 		}
 	}
-	
+
 	// Resolve gateway
 	gateway, ok := s.registry.Resolve(req.GatewayCode)
 	if !ok {
 		return nil, fmt.Errorf("gateway not found: %s", req.GatewayCode)
 	}
-	
+
 	// Check idempotency
 	reqJSON, _ := json.Marshal(req)
 	requestHash := ComputeRequestHash(reqJSON)
-	
+
 	if req.IdempotencyKey != "" {
 		existingID, isReplay, err := s.idempotencyStore.CheckAndStore(ctx, req.IdempotencyKey, requestHash)
 		if err != nil {
 			return nil, fmt.Errorf("idempotency check failed: %w", err)
 		}
-		
+
 		if isReplay {
 			// Return existing transaction as InitiateResponse
 			return s.getInitiateResponse(ctx, existingID)
 		}
 	}
-	
+
 	// Create transaction record
 	transactionIDStr := uuid.New().String()
 	fulfillmentKind := req.FulfillmentKind
 	if fulfillmentKind == "" {
 		fulfillmentKind = "voucher"
 	}
-	
+
 	var planID interface{}
 	if req.PlanID != nil {
 		planID = *req.PlanID
@@ -176,8 +182,26 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 	if gatewayOrgID > 0 {
 		orgID = &gatewayOrgID
 	}
-	feeAmount = s.calculateFee(ctx, req.GatewayCode, req.GatewayID, float64(req.Amount)/100.0)
+	feeAmount = s.calculateFee(ctx, req.GatewayCode, float64(req.Amount)/100.0)
 	netAmount := float64(req.Amount)/100.0 - feeAmount
+
+	// M-CIM: buyer identity stamping. Owner contact autofill never overrides
+	// Gift-contact values typed at checkout (SMS/PIN still goes to the typed
+	// recipient); ownership always resolves to the identity-customer.
+	if req.OwnerCustomerID != nil {
+		owner := *req.OwnerCustomerID
+		if req.CustomerID == nil {
+			req.CustomerID = &owner
+		}
+		if req.OwnerContacts != nil && !req.OwnerContacts.Empty() {
+			if req.CustomerPhone == "" && req.OwnerContacts.Phone != "" {
+				req.CustomerPhone = req.OwnerContacts.Phone
+			}
+			if req.CustomerEmail == "" && req.OwnerContacts.Email != "" {
+				req.CustomerEmail = req.OwnerContacts.Email
+			}
+		}
+	}
 
 	// F3.8: When gateway_id is provided, insert directly without gateway_code join
 	if req.GatewayID != nil {
@@ -260,51 +284,56 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		}
 		transactionID, _ = result.LastInsertId()
 	}
-	
+
 	// LastInsertId() may return 0 with INSERT...SELECT; query back the actual ID
 	if transactionID == 0 {
-		if err := s.db.QueryRowContext(ctx, 
+		if err := s.db.QueryRowContext(ctx,
 			`SELECT id FROM payments_paymenttransaction WHERE transaction_id = ?`, transactionIDStr,
 		).Scan(&transactionID); err != nil {
 			return nil, fmt.Errorf("failed to retrieve transaction ID after insert: %w", err)
 		}
 	}
-	
+
 	slog.Info("transaction created",
 		slog.Int64("transaction_id", transactionID),
 		slog.String("gateway", req.GatewayCode),
 		slog.String("amount", fmt.Sprintf("%d %s", req.Amount, req.Currency)),
 	)
-	
+
 	metrics.RecordPaymentInitiated(req.GatewayCode, req.MethodCode)
-	
+
 	// Call gateway to initiate
 	gatewayReq := gateways.InitiateRequest{
 		Amount: gateways.Money{
 			Amount:   req.Amount,
 			Currency: req.Currency,
 		},
-		Currency:        req.Currency,
-		MethodCode:      req.MethodCode,
-		CustomerEmail:   req.CustomerEmail,
-		CustomerPhone:   req.CustomerPhone,
-		ReturnURL:       "", // Will be configured per gateway
-		Metadata:        req.Metadata,
-		IdempotencyKey:  req.IdempotencyKey,
+		Currency:       req.Currency,
+		MethodCode:     req.MethodCode,
+		CustomerEmail:  req.CustomerEmail,
+		CustomerPhone:  req.CustomerPhone,
+		ReturnURL:      "", // Will be configured per gateway
+		Metadata:       req.Metadata,
+		IdempotencyKey: req.IdempotencyKey,
 	}
-	
+
 	gatewayResult, err := gateway.Initiate(ctx, gatewayReq)
 	if err != nil {
 		// Mark as failed
-		s.db.ExecContext(ctx, `
+		if _, markErr := s.db.ExecContext(ctx, `
 			UPDATE payments_paymenttransaction 
 			SET state = 'failed', status = 'failed', updated_at = NOW()
 			WHERE id = ?
-		`, transactionID)
+		`, transactionID); markErr != nil {
+			slog.Error("payments: failed to mark transaction failed",
+				slog.Int64("transaction_id", transactionID),
+				slog.Any("error", markErr),
+			)
+		}
 		metrics.RecordPaymentFailed("gateway_initiate_error")
 		return nil, fmt.Errorf("gateway initiation failed: %w", err)
 	}
-	
+
 	// Merge gateway result into existing metadata (preserving referral_code etc.)
 	mergedResponse := make(map[string]interface{})
 	if len(req.Metadata) > 0 {
@@ -315,7 +344,7 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 	mergedResponse["state"] = gatewayResult.State
 	mergedResponse["external_reference"] = gatewayResult.ExternalReference
 	gatewayResultJSON, _ := json.Marshal(mergedResponse)
-	
+
 	// Update transaction with gateway response
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE payments_paymenttransaction 
@@ -329,14 +358,14 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		string(gatewayResultJSON),
 		transactionID,
 	)
-	
+
 	if err != nil {
 		slog.Error("failed to update transaction after gateway initiation",
 			slog.Int64("transaction_id", transactionID),
 			slog.Any("error", err),
 		)
 	}
-	
+
 	// Handle synchronous terminal states
 	switch State(gatewayResult.State) {
 	case StateCompleted:
@@ -344,20 +373,23 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		slog.Info("transaction completed synchronously, triggering fulfillment",
 			slog.Int64("transaction_id", transactionID),
 		)
-		go s.triggerFulfillment(transactionID)
+		// Detached: fulfillment must outlive the request.
+		go s.triggerFulfillment(context.WithoutCancel(ctx), transactionID)
 	case StateFailed:
 		metrics.RecordPaymentFailed("gateway_rejected")
+	default:
+		// Non-terminal synchronous states need no action here.
 	}
-	
+
 	return &InitiateResponse{
-		TransactionID:     transactionID,
-		TransactionIDStr:  transactionIDStr,
-		State:             gatewayResult.State,
-		GatewayCode:       req.GatewayCode,
-		Amount:            req.Amount,
-		Currency:          req.Currency,
-		RedirectURL:       gatewayResult.RedirectURL,
-		CreatedAt:         time.Now(),
+		TransactionID:    transactionID,
+		TransactionIDStr: transactionIDStr,
+		State:            gatewayResult.State,
+		GatewayCode:      req.GatewayCode,
+		Amount:           req.Amount,
+		Currency:         req.Currency,
+		RedirectURL:      gatewayResult.RedirectURL,
+		CreatedAt:        time.Now(),
 	}, nil
 }
 
@@ -368,21 +400,21 @@ type GetStatusRequest struct {
 
 // GetStatusResponse represents the response with transaction status
 type GetStatusResponse struct {
-	TransactionID     int64             `json:"transaction_id"`
-	TransactionIDStr  string            `json:"transaction_id_str"`
-	State             string            `json:"state"`
-	Amount            int64             `json:"amount"`
-	Currency          string            `json:"currency"`
-	GatewayCode       string            `json:"gateway_code"`
-	ExternalReference string            `json:"external_reference,omitempty"`
-	VoucherPIN        string            `json:"voucher_pin,omitempty"`
-	CustomerEmail     string            `json:"customer_email,omitempty"`
-	CustomerPhone     string            `json:"customer_phone,omitempty"`
+	TransactionID     int64                  `json:"transaction_id"`
+	TransactionIDStr  string                 `json:"transaction_id_str"`
+	State             string                 `json:"state"`
+	Amount            int64                  `json:"amount"`
+	Currency          string                 `json:"currency"`
+	GatewayCode       string                 `json:"gateway_code"`
+	ExternalReference string                 `json:"external_reference,omitempty"`
+	VoucherPIN        string                 `json:"voucher_pin,omitempty"`
+	CustomerEmail     string                 `json:"customer_email,omitempty"`
+	CustomerPhone     string                 `json:"customer_phone,omitempty"`
 	GatewayResponse   map[string]interface{} `json:"gateway_response,omitempty"`
-	Username          string            `json:"username,omitempty"`
-	Password          string            `json:"password,omitempty"`
-	CreatedAt         time.Time         `json:"created_at"`
-	UpdatedAt         time.Time         `json:"updated_at"`
+	Username          string                 `json:"username,omitempty"`
+	Password          string                 `json:"password,omitempty"`
+	CreatedAt         time.Time              `json:"created_at"`
+	UpdatedAt         time.Time              `json:"updated_at"`
 }
 
 // nullString is a helper to convert sql.NullString to regular string
@@ -397,6 +429,40 @@ func (ns nullString) Value() string {
 	return ""
 }
 
+// Sentinel errors for transaction reference resolution.
+var (
+	// ErrInvalidTransactionRef means the reference is neither a positive
+	// database id nor a UUID.
+	ErrInvalidTransactionRef = errors.New("invalid transaction_id format")
+	// ErrTransactionNotFound means a well-formed reference matched no row.
+	ErrTransactionNotFound = errors.New("transaction not found")
+)
+
+// ResolveTransactionID accepts either the numeric database id or the public
+// UUID (payments_paymenttransaction.transaction_id) and returns the numeric id.
+// The mobile app navigates to /payments/{transaction_id_str}/status with the
+// UUID, so both forms must work.
+func (s *Service) ResolveTransactionID(ctx context.Context, ref string) (int64, error) {
+	if id, err := strconv.ParseInt(ref, 10, 64); err == nil && id > 0 {
+		return id, nil
+	}
+	if _, err := uuid.Parse(ref); err != nil {
+		return 0, ErrInvalidTransactionRef
+	}
+
+	var id int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM payments_paymenttransaction WHERE transaction_id = ?`, ref,
+	).Scan(&id)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return 0, ErrTransactionNotFound
+	case err != nil:
+		return 0, fmt.Errorf("failed to resolve transaction id: %w", err)
+	}
+	return id, nil
+}
+
 // GetStatus retrieves the current status of a transaction
 func (s *Service) GetStatus(ctx context.Context, transactionID int64) (*GetStatusResponse, error) {
 	return s.getTransactionResponse(ctx, transactionID)
@@ -406,10 +472,10 @@ func (s *Service) getTransactionResponse(ctx context.Context, transactionID int6
 	var resp GetStatusResponse
 	var gatewayResponseJSON string
 	var amountFloat float64
-	
+
 	// Use nullString for nullable fields
 	var externalRef, voucherPin, customerEmail, customerPhone nullString
-	
+
 	err := s.db.QueryRowContext(ctx, `
 		SELECT 
 			t.id, t.transaction_id, t.state, 
@@ -436,19 +502,19 @@ func (s *Service) getTransactionResponse(ctx context.Context, transactionID int6
 		&resp.CreatedAt,
 		&resp.UpdatedAt,
 	)
-	
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to query transaction: %w", err)
 	}
-	
+
 	_ = amountFloat // Silence unused warning, we'll use the amount_cents value
-	
+
 	// Convert nullStrings to regular strings
 	resp.ExternalReference = externalRef.Value()
 	resp.VoucherPIN = voucherPin.Value()
 	resp.CustomerEmail = customerEmail.Value()
 	resp.CustomerPhone = customerPhone.Value()
-	
+
 	// For subscription transactions, resolve PPPoE credentials from authentication_customer.
 	// The voucher_pin is stored as "sub:<customer_id>" — the actual RADIUS username/password
 	// is the customer_id value (same for both, written to radcheck as Cleartext-Password).
@@ -465,14 +531,14 @@ func (s *Service) getTransactionResponse(ctx context.Context, transactionID int6
 			resp.Password = customerUsername
 		}
 	}
-	
+
 	return &resp, nil
 }
 
 // getInitiateResponse retrieves transaction data formatted for InitiateResponse (used for idempotency replays)
 func (s *Service) getInitiateResponse(ctx context.Context, transactionID int64) (*InitiateResponse, error) {
 	var resp InitiateResponse
-	
+
 	err := s.db.QueryRowContext(ctx, `
 		SELECT 
 			t.id, t.transaction_id, t.state, 
@@ -490,11 +556,11 @@ func (s *Service) getInitiateResponse(ctx context.Context, transactionID int64) 
 		&resp.GatewayCode,
 		&resp.CreatedAt,
 	)
-	
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to query transaction: %w", err)
 	}
-	
+
 	resp.IsReplay = true
 	return &resp, nil
 }
@@ -512,7 +578,7 @@ func (s *Service) ListTransactions(ctx context.Context, req ListTransactionsRequ
 	if req.Limit <= 0 || req.Limit > 100 {
 		req.Limit = 20
 	}
-	
+
 	query := `
 		SELECT 
 			t.id, t.transaction_id, t.state, 
@@ -526,31 +592,31 @@ func (s *Service) ListTransactions(ctx context.Context, req ListTransactionsRequ
 		WHERE 1=1
 	`
 	args := []interface{}{}
-	
+
 	if req.CustomerID != nil {
 		query += " AND t.customer_id = ?"
 		args = append(args, *req.CustomerID)
 	}
-	
+
 	if req.State != "" {
 		query += " AND t.state = ?"
 		args = append(args, req.State)
 	}
-	
+
 	query += " ORDER BY t.created_at DESC LIMIT ? OFFSET ?"
 	args = append(args, req.Limit, req.Offset)
-	
+
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query transactions: %w", err)
 	}
 	defer rows.Close()
-	
+
 	var transactions []*GetStatusResponse
 	for rows.Next() {
 		var resp GetStatusResponse
 		var gatewayResponseJSON string
-		
+
 		err := rows.Scan(
 			&resp.TransactionID,
 			&resp.TransactionIDStr,
@@ -569,11 +635,232 @@ func (s *Service) ListTransactions(ctx context.Context, req ListTransactionsRequ
 		if err != nil {
 			continue
 		}
-		
+
 		transactions = append(transactions, &resp)
 	}
-	
+
 	return transactions, nil
+}
+
+// PaymentHistoryItem is a customer-safe view of a transaction for the mobile
+// history endpoint. Sensitive admin fields (gateway_response, internal ids)
+// are excluded; only fulfillment artifacts the customer already sees on the
+// payment status screen are included.
+type PaymentHistoryItem struct {
+	TransactionID    int64     `json:"transaction_id"`
+	TransactionIDStr string    `json:"transaction_id_str"`
+	State            string    `json:"state"`
+	FulfillmentKind  string    `json:"fulfillment_kind"`
+	Amount           int64     `json:"amount"`
+	Currency         string    `json:"currency"`
+	GatewayCode      string    `json:"gateway_code"`
+	VoucherPIN       string    `json:"voucher_pin,omitempty"`
+	SubscriptionID   int64     `json:"subscription_id,omitempty"`
+	Username         string    `json:"username,omitempty"`
+	Password         string    `json:"password,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// digitsSuffix returns the last n digits of s ("" when fewer digits exist).
+func digitsSuffix(s string, n int) string {
+	var digits []byte
+	for i := len(s) - 1; i >= 0 && len(digits) < n; i-- {
+		if s[i] >= '0' && s[i] <= '9' {
+			digits = append([]byte{s[i]}, digits...)
+		}
+	}
+	return string(digits)
+}
+
+// ListIdentityPaymentsRequest filters transactions by the verified customer
+// contact (phone and/or email from an identity token).
+type ListIdentityPaymentsRequest struct {
+	Phone  string
+	Email  string
+	Limit  int
+	Offset int
+	// CustomerIDs (M-CIM): customer ids resolved from identitylink — matched
+	// through the transaction customer FK so email/Google identities surface
+	// phone-based voucher purchases too.
+	CustomerIDs []int64
+}
+
+// identityContactClause builds the WHERE fragment matching a transaction to a
+// verified identity: phone last-9 bridge, case-insensitive email, or any of
+// the identitylink-resolved customer ids. Shared by payment history and
+// status access so the two can never drift (a user who can see a payment in
+// history must be able to poll its status, and vice versa).
+//
+// The fragment is meant for queries that alias payments_paymenttransaction AS t.
+func identityContactClause(phoneDigits, email string, customerIDs []int64) (string, []interface{}) {
+	clause := `
+		(
+			(? != '' AND RIGHT(REGEXP_REPLACE(t.customer_phone, '[^0-9]', ''), 9) = ?)
+			OR (? != '' AND LOWER(COALESCE(t.customer_email, '')) = ?)
+		)`
+	args := []interface{}{
+		phoneDigits, phoneDigits,
+		email, email,
+	}
+	if len(customerIDs) > 0 {
+		placeholders := make([]string, 0, len(customerIDs))
+		for _, id := range customerIDs {
+			placeholders = append(placeholders, "?")
+			args = append(args, id)
+		}
+		// Fully parenthesised: callers AND this fragment with their own
+		// predicates, so the customer-id OR must never escape it.
+		clause = fmt.Sprintf("((%s) OR t.customer_id IN (%s))",
+			clause, strings.Join(placeholders, ","))
+	}
+	return clause, args
+}
+
+// CanAccessTransaction reports whether a verified identity may read the given
+// transaction's status. Matching is identical to ListIdentityPayments (owner
+// customer id or contact bridge). An unknown transaction returns false, nil so
+// callers can answer with a uniform 404 and leak no existence oracle.
+func (s *Service) CanAccessTransaction(
+	ctx context.Context,
+	transactionID int64,
+	phone, email string,
+	customerIDs []int64,
+) (bool, error) {
+	phoneDigits := digitsSuffix(NormalizePhoneDigits(phone), 9)
+	email = strings.ToLower(strings.TrimSpace(email))
+	if phoneDigits == "" && email == "" && len(customerIDs) == 0 {
+		return false, nil
+	}
+
+	clause, args := identityContactClause(phoneDigits, email, customerIDs)
+	// #nosec G201 -- constant SQL; identityContactClause returns only literals with ? placeholders.
+	query := fmt.Sprintf(`
+		SELECT EXISTS(
+			SELECT 1 FROM payments_paymenttransaction t WHERE t.id = ? AND %s
+		)`, clause)
+	args = append([]interface{}{transactionID}, args...)
+
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check transaction access: %w", err)
+	}
+	return exists, nil
+}
+
+// ListIdentityPayments lists transactions whose customer contact matches the
+// identity: phone matches exact (normalized) or last-9-digit suffix (bridging
+// local vs E.164 formats, same rule as push device lookup), email matches
+// case-insensitively. Newest first, paginated.
+func (s *Service) ListIdentityPayments(ctx context.Context, req ListIdentityPaymentsRequest) ([]*PaymentHistoryItem, error) {
+	if req.Limit <= 0 || req.Limit > 100 {
+		req.Limit = 20
+	}
+	if req.Offset < 0 {
+		req.Offset = 0
+	}
+
+	phoneDigits := digitsSuffix(NormalizePhoneDigits(req.Phone), 9)
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	if phoneDigits == "" && email == "" && len(req.CustomerIDs) == 0 {
+		return []*PaymentHistoryItem{}, nil
+	}
+
+	contactClause, args := identityContactClause(phoneDigits, email, req.CustomerIDs)
+
+	// #nosec G201 -- constant SQL; identityContactClause returns only literals with ? placeholders.
+	query := fmt.Sprintf(`
+		SELECT
+			t.id, t.transaction_id, t.state,
+			CAST(t.amount * 100 AS SIGNED) as amount_cents, t.currency,
+			COALESCE(g.gateway_code, ''), t.fulfillment_kind,
+			t.voucher_pin, t.created_at, t.updated_at
+		FROM payments_paymenttransaction t
+		LEFT JOIN payments_paymentgateway g ON g.id = t.gateway_id
+		WHERE %s
+		ORDER BY t.created_at DESC
+		LIMIT ? OFFSET ?
+	`, contactClause)
+	args = append(args, req.Limit, req.Offset)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query payment history: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*PaymentHistoryItem
+	for rows.Next() {
+		var (
+			item       PaymentHistoryItem
+			voucherPin sql.NullString
+			txnIDStr   string
+		)
+		err := rows.Scan(
+			&item.TransactionID,
+			&txnIDStr,
+			&item.State,
+			&item.Amount,
+			&item.Currency,
+			&item.GatewayCode,
+			&item.FulfillmentKind,
+			&voucherPin,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan payment history row: %w", err)
+		}
+		item.TransactionIDStr = txnIDStr
+		item.VoucherPIN = voucherPin.String
+
+		// Voucher PINs and subscription credentials only surface once the
+		// payment is complete — mirrors the payment status screen behavior.
+		if item.State == string(StateCompleted) {
+			if strings.HasPrefix(item.VoucherPIN, "sub:") {
+				// "sub:<subscription_id>" — resolve the subscriber's RADIUS
+				// credentials from the customer record, same as status. The
+				// internal sub: token itself is replaced by subscription_id.
+				subID, parseErr := strconv.ParseInt(strings.TrimPrefix(item.VoucherPIN, "sub:"), 10, 64)
+				item.VoucherPIN = ""
+				if parseErr == nil {
+					item.SubscriptionID = subID
+				}
+				var credentials string
+				err := s.db.QueryRowContext(ctx, `
+					SELECT ac.customer_id
+					FROM payments_paymenttransaction t
+					JOIN authentication_customer ac ON ac.id = t.customer_id
+					WHERE t.id = ?
+				`, item.TransactionID).Scan(&credentials)
+				if err == nil && credentials != "" {
+					item.Username = credentials
+					item.Password = credentials
+				}
+			}
+		} else {
+			item.VoucherPIN = ""
+		}
+
+		items = append(items, &item)
+	}
+	if items == nil {
+		items = []*PaymentHistoryItem{}
+	}
+
+	return items, nil
+}
+
+// NormalizePhoneDigits reduces a phone number to its digits ("+26377..." and
+// "077..." keep their distinct digit sequences; callers match on suffix).
+func NormalizePhoneDigits(phone string) string {
+	var b []byte
+	for _, r := range phone {
+		if r >= '0' && r <= '9' {
+			b = append(b, byte(r))
+		}
+	}
+	return string(b)
 }
 
 // ProcessWebhook processes a verified webhook event and transitions transaction state.
@@ -589,7 +876,7 @@ func (s *Service) ProcessWebhook(ctx context.Context, gatewayCode string, event 
 	`, event.ExternalReference, gatewayCode).Scan(&transactionID, &currentState)
 
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("transaction not found for external_reference=%s gateway=%s", event.ExternalReference, gatewayCode)
 		}
 		return fmt.Errorf("failed to query transaction: %w", err)
@@ -662,7 +949,8 @@ func (s *Service) ProcessWebhook(ctx context.Context, gatewayCode string, event 
 			slog.Info("transaction completed, triggering fulfillment",
 				slog.Int64("transaction_id", transactionID),
 			)
-			go s.triggerFulfillment(transactionID)
+			// Detached: fulfillment must outlive the webhook request.
+			go s.triggerFulfillment(context.WithoutCancel(ctx), transactionID)
 		}
 		if toState == StateFailed {
 			metrics.RecordPaymentFailed("gateway_failure")
@@ -672,29 +960,43 @@ func (s *Service) ProcessWebhook(ctx context.Context, gatewayCode string, event 
 	return nil
 }
 
+// Fulfillment retry policy. Fulfillment runs after the money is captured, so
+// transient failures (DB blip, notifier down) must be retried instead of
+// poisoning the transaction state.
+const fulfillmentMaxAttempts = 3
+
+// fulfillmentRetryDelay is the base of an exponential backoff (2s, 4s by
+// default). A package var so tests can shorten it.
+var fulfillmentRetryDelay = 2 * time.Second
+
 // triggerFulfillment triggers fulfillment for a completed transaction.
-// It should be called with `go s.triggerFulfillment(id)` to run asynchronously.
-func (s *Service) triggerFulfillment(transactionID int64) {
-	ctx := context.Background()
+// It should be called with `go s.triggerFulfillment(context.WithoutCancel(ctx), id)`
+// so values propagate but cancellation does not: fulfillment must outlive the request.
+func (s *Service) triggerFulfillment(ctx context.Context, transactionID int64) {
 
 	// Fetch transaction details needed for fulfillment
 	var amountFloat float64
-	var currency, customerPhone, customerEmail, fulfillmentKind, transactionIDStr string
+	var currency, fulfillmentKind, transactionIDStr string
+	// Contacts are nullable: an anonymous checkout has neither, and a NULL
+	// there must not abort fulfillment (scanning into string would error and
+	// silently skip issuing the voucher for a captured payment).
+	var customerPhone, customerEmail sql.NullString
 	var planID sql.NullInt64
 	var gatewayOrgID sql.NullInt64
 	var gatewayResponse sql.NullString
+	var ownerCustomerID sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
 			t.transaction_id, t.amount, t.currency,
 			t.customer_phone, t.customer_email, t.fulfillment_kind,
-			t.tariff_plan_id, g.organization_id, t.gateway_response
+			t.tariff_plan_id, g.organization_id, t.gateway_response, t.customer_id
 		FROM payments_paymenttransaction t
 		JOIN payments_paymentgateway g ON g.id = t.gateway_id
 		WHERE t.id = ?
 	`, transactionID).Scan(
 		&transactionIDStr, &amountFloat, &currency,
 		&customerPhone, &customerEmail, &fulfillmentKind,
-		&planID, &gatewayOrgID, &gatewayResponse,
+		&planID, &gatewayOrgID, &gatewayResponse, &ownerCustomerID,
 	)
 	if err != nil {
 		slog.Error("fulfillment: failed to query transaction details",
@@ -734,8 +1036,8 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 		Amount:           amountCents,
 		Currency:         currency,
 		DurationDays:     durationDays,
-		CustomerPhone:    customerPhone,
-		CustomerEmail:    customerEmail,
+		CustomerPhone:    customerPhone.String,
+		CustomerEmail:    customerEmail.String,
 		FulfillmentKind:  fulfillmentKind,
 		NasIPAddress:     nasIP,
 		NasIdentifier:    nasID,
@@ -744,22 +1046,48 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 	if gatewayOrgID.Valid {
 		fr.OrganizationID = gatewayOrgID.Int64
 	}
+	if ownerCustomerID.Valid {
+		fr.OwnerCustomerID = ownerCustomerID.Int64
+	}
 	if planID.Valid {
 		fr.PlanID = planID.Int64
 	}
-	result, err := s.fulfillmentService.Fulfill(ctx, fr)
-	if err != nil {
-		slog.Error("fulfillment failed",
+	var result *fulfillment.FulfillResult
+	for attempt := 1; attempt <= fulfillmentMaxAttempts; attempt++ {
+		result, err = s.fulfillmentService.Fulfill(ctx, fr)
+		if err == nil {
+			break
+		}
+		slog.Error("fulfillment attempt failed",
 			slog.Int64("transaction_id", transactionID),
+			slog.Int("attempt", attempt),
+			slog.Int("max_attempts", fulfillmentMaxAttempts),
 			slog.Any("error", err),
 		)
-		// Rollback partial radcheck rows if a PIN was generated
+		if attempt == fulfillmentMaxAttempts {
+			break
+		}
+		select {
+		case <-time.After(fulfillmentRetryDelay << (attempt - 1)):
+		case <-ctx.Done():
+			return
+		}
+	}
+	if err != nil {
+		// The gateway already captured the money. The transaction stays
+		// `completed` with voucher_pin NULL ("paid, awaiting fulfillment"):
+		// that keeps the debt visible to support/refund flows and the row
+		// retryable by the poller. Flipping a paid transaction to the
+		// terminal `failed` state hides the charge and blocks every retry.
 		if result != nil && result.VoucherPIN != "" {
 			_ = s.fulfillmentService.Rollback(ctx, result.VoucherPIN)
 		}
-		// Mark transaction as failed
-		_, _ = s.stateMachine.Transition(ctx, s.db, transactionID, StateCompleted, StateFailed)
-		metrics.RecordPaymentFailed("fulfillment_error")
+		metrics.RecordFulfillmentFailure(fulfillmentKind, "fulfillment_error")
+		slog.Error("fulfillment failed after retries; leaving transaction completed for retry",
+			slog.Int64("transaction_id", transactionID),
+			slog.String("fulfillment_kind", fulfillmentKind),
+			slog.Any("error", err),
+		)
 		return
 	}
 
@@ -769,7 +1097,7 @@ func (s *Service) triggerFulfillment(transactionID int64) {
 	)
 
 	// Notify Django of payment completion (triggers commission processing)
-	go s.notifyDjangoCompletion(transactionID, referralCode)
+	go s.notifyDjangoCompletion(ctx, transactionID, referralCode)
 }
 
 // PollStatus checks the current status of a transaction via the gateway's API.
@@ -784,7 +1112,7 @@ func (s *Service) PollStatus(ctx context.Context, transactionID int64) (*GetStat
 	`, transactionID).Scan(&externalRef, &gatewayCode, &currentState)
 
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("transaction not found: %d", transactionID)
 		}
 		return nil, fmt.Errorf("failed to query transaction: %w", err)
@@ -821,7 +1149,8 @@ func (s *Service) PollStatus(ctx context.Context, transactionID int64) (*GetStat
 			changed, _ := s.stateMachine.Transition(ctx, s.db, transactionID, fromState, toState)
 			if changed && toState == StateCompleted {
 				metrics.RecordPaymentCompleted()
-				go s.triggerFulfillment(transactionID)
+				// Detached: fulfillment must outlive the request.
+				go s.triggerFulfillment(context.WithoutCancel(ctx), transactionID)
 			}
 			if changed && toState == StateFailed {
 				metrics.RecordPaymentFailed("gateway_failure")
@@ -834,21 +1163,21 @@ func (s *Service) PollStatus(ctx context.Context, transactionID int64) (*GetStat
 
 // Plan represents a tariff plan from the catalog
 type Plan struct {
-	ID                 int64   `json:"id"`
-	Name               string  `json:"name"`
-	Price              int64   `json:"price"` // minor currency units (500 = R5.00)
-	DisplayAmount      float64 `json:"display_amount"`
-	Currency           string  `json:"currency"`
-	DurationSeconds    int64   `json:"duration_seconds"`
-	DurationDays       int64   `json:"duration_days"`
-	DownloadSpeed      int64   `json:"download_speed"`
-	UploadSpeed        int64   `json:"upload_speed"`
-	MaxSessions        int64   `json:"max_sessions"`
-	FupDataQuotaMb     int64   `json:"fup_data_quota_mb"`
-	FupDownloadSpeed   int64   `json:"fup_download_speed"`
-	FupUploadSpeed     int64   `json:"fup_upload_speed"`
-	MarketingTagline   string  `json:"marketing_tagline,omitempty"`
-	PlanType           string  `json:"plan_type"` // "hotspot" | "subscription" | "smoke"
+	ID               int64   `json:"id"`
+	Name             string  `json:"name"`
+	Price            int64   `json:"price"` // minor currency units (500 = R5.00)
+	DisplayAmount    float64 `json:"display_amount"`
+	Currency         string  `json:"currency"`
+	DurationSeconds  int64   `json:"duration_seconds"`
+	DurationDays     int64   `json:"duration_days"`
+	DownloadSpeed    int64   `json:"download_speed"`
+	UploadSpeed      int64   `json:"upload_speed"`
+	MaxSessions      int64   `json:"max_sessions"`
+	FupDataQuotaMb   int64   `json:"fup_data_quota_mb"`
+	FupDownloadSpeed int64   `json:"fup_download_speed"`
+	FupUploadSpeed   int64   `json:"fup_upload_speed"`
+	MarketingTagline string  `json:"marketing_tagline,omitempty"`
+	PlanType         string  `json:"plan_type"` // "hotspot" | "subscription" | "smoke"
 }
 
 func (s *Service) validateGatewayCurrency(ctx context.Context, gatewayCode, currency string) error {
@@ -906,7 +1235,7 @@ func (s *Service) resolveGatewayOrgID(ctx context.Context, gatewayCode string, g
 }
 
 // calculateFee looks up the best-matching FeeSchedule and computes the fee for the amount.
-func (s *Service) calculateFee(ctx context.Context, gatewayCode string, gatewayID *int64, amount float64) float64 {
+func (s *Service) calculateFee(ctx context.Context, gatewayCode string, amount float64) float64 {
 	// Try org-specific, then gateway-specific, then platform-wide default
 	// Order by priority DESC, take first match
 	rows, err := s.db.QueryContext(ctx, `
@@ -945,7 +1274,7 @@ func (s *Service) validatePlanAmount(ctx context.Context, planID, amount int64, 
 			SELECT price_minor, COALESCE(currency, ?) FROM billing_billingplan
 			WHERE id = ? AND is_active = 1
 		`, s.defaultCurrency, planID).Scan(&price, &planCurrency)
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("subscription plan not found: %d", planID)
 		}
 		if err != nil {
@@ -963,7 +1292,9 @@ func (s *Service) validatePlanAmount(ctx context.Context, planID, amount int64, 
 	var price int64
 	var planCurrency string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT price, currency FROM services_tariffplan WHERE id = ? AND is_active = 1
+		SELECT tp.price, COALESCE(sc.code, '') FROM services_tariffplan tp
+		LEFT JOIN services_supportedcurrency sc ON sc.id = tp.currency_fk_id
+		WHERE tp.id = ? AND tp.is_active = 1
 	`, planID).Scan(&price, &planCurrency)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("plan not found: %d", planID)
@@ -983,16 +1314,17 @@ func (s *Service) validatePlanAmount(ctx context.Context, planID, amount int64, 
 // ListPlans returns all active tariff plans ordered by price
 func (s *Service) ListPlans(ctx context.Context) ([]*Plan, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id,
-			COALESCE(NULLIF(package_label, ''), description, ''),
-			price, currency, seconds, duration_days,
-			download_speed, upload_speed, max_sessions,
-			fup_data_quota_mb, fup_download_speed, fup_upload_speed,
-			COALESCE(marketing_tagline, ''),
-			COALESCE(plan_kind, 'hotspot')
-		FROM services_tariffplan
-		WHERE is_active = 1 AND (plan_kind IS NULL OR plan_kind != 'smoke')
-		ORDER BY price ASC
+		SELECT tp.id,
+			COALESCE(NULLIF(tp.package_label, ''), tp.description, ''),
+			tp.price, COALESCE(sc.code, ''), tp.seconds, tp.duration_days,
+			tp.download_speed, tp.upload_speed, tp.max_sessions,
+			tp.fup_data_quota_mb, tp.fup_download_speed, tp.fup_upload_speed,
+			COALESCE(tp.marketing_tagline, ''),
+			COALESCE(tp.plan_kind, 'hotspot')
+		FROM services_tariffplan tp
+		LEFT JOIN services_supportedcurrency sc ON sc.id = tp.currency_fk_id
+		WHERE tp.is_active = 1 AND (tp.plan_kind IS NULL OR tp.plan_kind != 'smoke')
+		ORDER BY tp.price ASC
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query plans: %w", err)
@@ -1040,7 +1372,7 @@ func (s *Service) ListSubscriptionPlans(ctx context.Context) ([]*Plan, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT bp.id, bp.name,
 			bp.price_minor, COALESCE(bp.currency, ?),
-			COALESCE(bp.billing_cycle_id, 0),
+			COALESCE(bc.duration_days, 30),
 			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.download_speed'), 0),
 			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.upload_speed'), 0),
 			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.max_sessions'), 1),
@@ -1048,6 +1380,7 @@ func (s *Service) ListSubscriptionPlans(ctx context.Context) ([]*Plan, error) {
 			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.fup_download_speed'), 0),
 			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.fup_upload_speed'), 0)
 		FROM billing_billingplan bp
+		LEFT JOIN services_billingcycle bc ON bc.id = bp.billing_cycle_id
 		WHERE bp.is_active = 1
 		ORDER BY bp.price_minor ASC
 	`, s.defaultCurrency)
@@ -1085,13 +1418,13 @@ func (s *Service) ListSubscriptionPlans(ctx context.Context) ([]*Plan, error) {
 }
 
 // TriggerFulfillment exposes triggerFulfillment for external callers (e.g., poller).
+// The poller loop is already background-scoped, so Background is correct here.
 func (s *Service) TriggerFulfillment(transactionID int64) {
-	s.triggerFulfillment(transactionID)
+	s.triggerFulfillment(context.Background(), transactionID)
 }
 
 // notifyDjangoCompletion POSTs to Django webhook to trigger commission processing.
-func (s *Service) notifyDjangoCompletion(transactionID int64, referralCode string) {
-	ctx := context.Background()
+func (s *Service) notifyDjangoCompletion(ctx context.Context, transactionID int64, referralCode string) {
 
 	// Look up customer_id for this transaction
 	var customerID sql.NullInt64
@@ -1117,6 +1450,7 @@ func (s *Service) notifyDjangoCompletion(transactionID int64, referralCode strin
 	internalKey := os.Getenv("DJANGO_INTERNAL_API_KEY")
 
 	url := djangoBaseURL + "/api/sales-agents/webhooks/payment-completed/"
+	// #nosec G704 -- destination is operator-controlled deployment config (DJANGO_BASE_URL), not request input.
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		slog.Error("webhook: failed to create request", slog.Any("error", err))
@@ -1126,6 +1460,7 @@ func (s *Service) notifyDjangoCompletion(transactionID int64, referralCode strin
 	req.Header.Set("X-Internal-API-Key", internalKey)
 
 	client := &http.Client{Timeout: 10 * time.Second}
+	// #nosec G704 -- request URL built above from operator-controlled DJANGO_BASE_URL env.
 	resp, err := client.Do(req)
 	if err != nil {
 		slog.Error("webhook: failed to notify Django",
@@ -1160,8 +1495,8 @@ type MethodDetails struct {
 
 // PaymentMethod represents a payment method from the database
 type PaymentMethod struct {
-	GatewayCode string          `json:"gateway_code"`
-	Method      MethodDetails   `json:"method"`
+	GatewayCode string        `json:"gateway_code"`
+	Method      MethodDetails `json:"method"`
 }
 
 // ListPaymentMethods returns active payment methods from the database, optionally filtered by gateway
@@ -1177,22 +1512,22 @@ func (s *Service) ListPaymentMethods(ctx context.Context, gatewayCode string) ([
 		JOIN payments_paymentgateway pg ON pm.gateway_id = pg.id
 		WHERE pm.is_active = 1 AND pg.is_active = 1
 	`
-	
+
 	var args []interface{}
 	if gatewayCode != "" {
 		query += " AND pg.gateway_code = ?"
 		args = append(args, gatewayCode)
 	}
-	
+
 	query += " ORDER BY pm.display_order ASC"
-	
+
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query payment methods: %w", err)
 	}
 	defer rows.Close()
 
-	var methods []*PaymentMethod
+	methods := make([]*PaymentMethod, 0)
 	for rows.Next() {
 		var m PaymentMethod
 		var requiresPhone, requiresRedirect sql.NullBool
@@ -1225,13 +1560,13 @@ type GatewayFees struct {
 
 // Gateway represents a payment gateway from the database
 type Gateway struct {
-	ID            int64           `json:"id"` // F3.8: explicit gateway ID for org-scoped resolution
-	Code          string          `json:"code"`
-	Name          string          `json:"name"`
-	Description   string          `json:"description"`
-	Fees          GatewayFees     `json:"fees"`
-	Features      []string        `json:"features"`
-	IsActive      bool            `json:"is_active"`
+	ID          int64       `json:"id"` // F3.8: explicit gateway ID for org-scoped resolution
+	Code        string      `json:"code"`
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Fees        GatewayFees `json:"fees"`
+	Features    []string    `json:"features"`
+	IsActive    bool        `json:"is_active"`
 }
 
 // ListGateways returns active payment gateways with their fee structures
@@ -1262,7 +1597,7 @@ func (s *Service) ListGateways(ctx context.Context, currency string) ([]*Gateway
 	}
 	defer rows.Close()
 
-	var gateways []*Gateway
+	gateways := make([]*Gateway, 0)
 	for rows.Next() {
 		var g Gateway
 		var configJSON []byte
@@ -1273,7 +1608,7 @@ func (s *Service) ListGateways(ctx context.Context, currency string) ([]*Gateway
 			slog.Warn("failed to scan gateway", slog.Any("error", err))
 			continue
 		}
-		
+
 		// Parse configuration JSON to extract fees and features
 		if len(configJSON) > 0 {
 			var config map[string]interface{}
@@ -1332,7 +1667,7 @@ func (s *Service) Refund(ctx context.Context, transactionID int64) error {
 	`, transactionID).Scan(&externalRef, &gatewayCode, &currentState, &voucherPin, &amountFloat, &currency)
 
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("transaction not found: %d", transactionID)
 		}
 		return fmt.Errorf("failed to query transaction: %w", err)
@@ -1411,7 +1746,7 @@ func (s *Service) Cancel(ctx context.Context, transactionID int64) error {
 	`, transactionID).Scan(&externalRef, &gatewayCode, &currentState)
 
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("transaction not found: %d", transactionID)
 		}
 		return fmt.Errorf("failed to query transaction: %w", err)
@@ -1488,11 +1823,11 @@ func (s *Service) GetWebhookLogs(ctx context.Context, transactionID int64) ([]ma
 			continue
 		}
 		entry := map[string]interface{}{
-			"id":                id,
-			"gateway_code":      gatewayCode,
-			"signature_valid":   sigValid,
-			"processed":         processed,
-			"error":             errMsg,
+			"id":                 id,
+			"gateway_code":       gatewayCode,
+			"signature_valid":    sigValid,
+			"processed":          processed,
+			"error":              errMsg,
 			"external_reference": externalRef,
 		}
 		if receivedAt.Valid {
@@ -1521,19 +1856,19 @@ func (s *Service) logWebhook(ctx context.Context, gatewayCode string, event gate
 
 // SubscriptionInfo is the response from GetSubscription.
 type SubscriptionInfo struct {
-	ID             int64   `json:"id"`
-	CustomerID     int64   `json:"customer_id"`
-	PlanID         int64   `json:"plan_id"`
-	PlanName       string  `json:"plan_name"`
-	PriceMinor     int64   `json:"price_minor"`
-	Currency       string  `json:"currency"`
-	DownloadSpeed  int     `json:"download_speed"`
-	UploadSpeed    int     `json:"upload_speed"`
-	Status         string  `json:"status"`
-	StartDate      string  `json:"start_date"`
-	EndDate        string  `json:"end_date"`
-	AutoRenew      bool    `json:"auto_renew"`
-	DaysRemaining  int     `json:"days_remaining"`
+	ID            int64  `json:"id"`
+	CustomerID    int64  `json:"customer_id"`
+	PlanID        int64  `json:"plan_id"`
+	PlanName      string `json:"plan_name"`
+	PriceMinor    int64  `json:"price_minor"`
+	Currency      string `json:"currency"`
+	DownloadSpeed int    `json:"download_speed"`
+	UploadSpeed   int    `json:"upload_speed"`
+	Status        string `json:"status"`
+	StartDate     string `json:"start_date"`
+	EndDate       string `json:"end_date"`
+	AutoRenew     bool   `json:"auto_renew"`
+	DaysRemaining int    `json:"days_remaining"`
 }
 
 // GetSubscription returns the current subscription details for a given ID.
@@ -1555,14 +1890,14 @@ func (s *Service) GetSubscription(ctx context.Context, subscriptionID int64) (*S
 		&info.StartDate, &endDate, &info.AutoRenew,
 	)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("subscription %d not found", subscriptionID)
 		}
 		return nil, fmt.Errorf("query subscription: %w", err)
 	}
 	if endDate.Valid {
 		info.EndDate = endDate.Time.Format("2006-01-02T15:04:05Z")
-		days := endDate.Time.Sub(time.Now()).Hours() / 24
+		days := time.Until(endDate.Time).Hours() / 24
 		if days < 0 {
 			days = 0
 		}
@@ -1573,14 +1908,14 @@ func (s *Service) GetSubscription(ctx context.Context, subscriptionID int64) (*S
 
 // AdjustmentQuote is the response from CalculateAdjustment.
 type AdjustmentQuote struct {
-	SubscriptionID  int64             `json:"subscription_id"`
-	OldPlan         PlanInfo          `json:"old_plan"`
-	NewPlan         PlanInfo          `json:"new_plan"`
-	ProrationCredit float64           `json:"proration_credit"`
-	ProrationCharge float64           `json:"proration_charge"`
-	NetAmount       float64           `json:"net_amount"`
-	DaysRemaining   int               `json:"days_remaining"`
-	BillingDays     int               `json:"billing_days"`
+	SubscriptionID  int64    `json:"subscription_id"`
+	OldPlan         PlanInfo `json:"old_plan"`
+	NewPlan         PlanInfo `json:"new_plan"`
+	ProrationCredit float64  `json:"proration_credit"`
+	ProrationCharge float64  `json:"proration_charge"`
+	NetAmount       float64  `json:"net_amount"`
+	DaysRemaining   int      `json:"days_remaining"`
+	BillingDays     int      `json:"billing_days"`
 }
 
 // PlanInfo is a summary of a subscription plan.
@@ -1605,7 +1940,7 @@ func (s *Service) CalculateAdjustment(ctx context.Context, subscriptionID, newPl
 		WHERE id = ?
 	`, subscriptionID).Scan(&currentPlanID, &startDate, &endDate, &status)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("subscription %d not found", subscriptionID)
 		}
 		return nil, fmt.Errorf("query subscription: %w", err)
@@ -1635,7 +1970,7 @@ func (s *Service) CalculateAdjustment(ctx context.Context, subscriptionID, newPl
 		FROM billing_billingplan WHERE id = ? AND is_active = TRUE
 	`, newPlanID).Scan(&newPlan.ID, &newPlan.Name, &newPlan.PriceMinor, &newPlan.Currency, &newPlan.DownloadSpeed, &newPlan.UploadSpeed)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("new plan %d not found or inactive", newPlanID)
 		}
 		return nil, fmt.Errorf("query new plan: %w", err)
@@ -1669,3 +2004,7 @@ func (s *Service) CalculateAdjustment(ctx context.Context, subscriptionID, newPl
 		BillingDays:     billingDays,
 	}, nil
 }
+
+// Database exposes the underlying DB handle for identity/profile enrichments
+// (read-only usage from the httpapi package).
+func (s *Service) Database() *sql.DB { return s.db }

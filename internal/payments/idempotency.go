@@ -30,10 +30,10 @@ func (s *IdempotencyStore) CheckAndStore(ctx context.Context, key string, reques
 
 	// Try to insert the key. MySQL does not support RETURNING on INSERT ... ON DUPLICATE KEY UPDATE.
 	result, err := s.db.ExecContext(ctx, `
-		INSERT INTO payments_idempotency_key (` + "`key`" + `, request_hash, created_at)
+		INSERT INTO payments_idempotency_key (`+"`key`"+`, request_hash, created_at)
 		VALUES (?, ?, NOW())
 		ON DUPLICATE KEY UPDATE
-			` + "`key` = `key`" + `
+			`+"`key` = `key`"+`
 	`, key, requestHash)
 
 	if err != nil {
@@ -79,21 +79,21 @@ func (s *IdempotencyStore) GetExistingTransaction(ctx context.Context, key strin
 	if key == "" {
 		return 0, errors.New("empty idempotency key")
 	}
-	
+
 	var transactionID int64
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id 
 		FROM payments_paymenttransaction 
 		WHERE idempotency_key = ?
 	`, key).Scan(&transactionID)
-	
+
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, fmt.Errorf("no transaction found for idempotency key: %s", key)
 		}
 		return 0, fmt.Errorf("failed to query idempotency key: %w", err)
 	}
-	
+
 	return transactionID, nil
 }
 
@@ -130,14 +130,14 @@ func (k WebhookEventKey) String() string {
 func (s *WebhookReplayStore) CheckAndLog(ctx context.Context, key WebhookEventKey, rawBody []byte, headers map[string][]string) (bool, error) {
 	eventKey := key.String()
 	eventHash := ComputeRequestHash(rawBody)
-	
+
 	// Check if we've seen this exact event before
 	var existingID int64
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id FROM payments_webhook_replay_log
 		WHERE event_key = ? AND event_hash = ?
 	`, eventKey, eventHash).Scan(&existingID)
-	
+
 	if err == nil {
 		slog.Info("webhook replay detected",
 			slog.String("event_key", eventKey),
@@ -145,21 +145,21 @@ func (s *WebhookReplayStore) CheckAndLog(ctx context.Context, key WebhookEventKe
 		)
 		return true, nil
 	}
-	
+
 	if !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("failed to check webhook replay: %w", err)
 	}
-	
+
 	// Not a replay - log it
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO payments_webhook_replay_log (event_key, event_hash, received_at)
 		VALUES (?, ?, NOW())
 	`, eventKey, eventHash)
-	
+
 	if err != nil {
 		return false, fmt.Errorf("failed to log webhook event: %w", err)
 	}
-	
+
 	return false, nil
 }
 
@@ -169,11 +169,11 @@ func (s *IdempotencyStore) CleanupOldKeys(ctx context.Context, retention time.Du
 		DELETE FROM payments_idempotency_key
 		WHERE created_at < DATE_SUB(NOW(), INTERVAL ? SECOND)
 	`, int64(retention.Seconds()))
-	
+
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup idempotency keys: %w", err)
 	}
-	
+
 	rows, _ := result.RowsAffected()
 	return rows, nil
 }
@@ -184,11 +184,11 @@ func (s *WebhookReplayStore) CleanupOldWebhooks(ctx context.Context, retention t
 		DELETE FROM payments_webhook_replay_log
 		WHERE received_at < DATE_SUB(NOW(), INTERVAL ? SECOND)
 	`, int64(retention.Seconds()))
-	
+
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup webhook logs: %w", err)
 	}
-	
+
 	rows, _ := result.RowsAffected()
 	return rows, nil
 }

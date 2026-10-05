@@ -15,9 +15,9 @@ const twilioAPIBase = "https://api.twilio.com/2010-04-01"
 
 // Provider implements the notify.Provider interface for Twilio
 type Provider struct {
-	accountSID   string
-	authToken    string
-	phoneNumber  string
+	accountSID  string
+	authToken   string
+	phoneNumber string
 	client      *http.Client
 }
 

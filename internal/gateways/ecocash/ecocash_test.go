@@ -54,7 +54,7 @@ func mockEcoCashServer(t *testing.T) (*httptest.Server, *Client) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnprocessableEntity)
 				json.NewEncoder(w).Encode(map[string]string{
-					"status": "Failed",
+					"status":        "Failed",
 					"statusMessage": "Business rule violation",
 				})
 				return
@@ -184,10 +184,10 @@ func TestAdapter_Initiate_Success(t *testing.T) {
 	adapter := NewAdapterWithClient(client, server.URL+"/webhook", server.URL+"/return")
 
 	result, err := adapter.Initiate(context.Background(), gateways.InitiateRequest{
-		Amount:        gateways.Money{Amount: 500, Currency: "USD"},
-		Currency:      "USD",
-		MethodCode:    MethodEcoCash,
-		CustomerPhone: "0772123456",
+		Amount:         gateways.Money{Amount: 500, Currency: "USD"},
+		Currency:       "USD",
+		MethodCode:     MethodEcoCash,
+		CustomerPhone:  "0772123456",
 		IdempotencyKey: "test-ref-001",
 	})
 
@@ -232,10 +232,10 @@ func TestAdapter_Initiate_BusinessRuleViolation(t *testing.T) {
 	adapter := NewAdapterWithClient(client, server.URL+"/webhook", server.URL+"/return")
 
 	_, err := adapter.Initiate(context.Background(), gateways.InitiateRequest{
-		Amount:        gateways.Money{Amount: 500, Currency: "USD"},
-		Currency:      "USD",
-		MethodCode:    MethodEcoCash,
-		CustomerPhone: "07721234560004", // magic suffix triggers 422
+		Amount:         gateways.Money{Amount: 500, Currency: "USD"},
+		Currency:       "USD",
+		MethodCode:     MethodEcoCash,
+		CustomerPhone:  "07721234560004", // magic suffix triggers 422
 		IdempotencyKey: "test-ref-422",
 	})
 
@@ -250,10 +250,10 @@ func TestAdapter_Initiate_AuthFailure(t *testing.T) {
 	adapter := NewAdapterWithClient(client, server.URL+"/webhook", server.URL+"/return")
 
 	_, err := adapter.Initiate(context.Background(), gateways.InitiateRequest{
-		Amount:        gateways.Money{Amount: 500, Currency: "USD"},
-		Currency:      "USD",
-		MethodCode:    MethodEcoCash,
-		CustomerPhone: "07721234560005", // magic suffix triggers 401
+		Amount:         gateways.Money{Amount: 500, Currency: "USD"},
+		Currency:       "USD",
+		MethodCode:     MethodEcoCash,
+		CustomerPhone:  "07721234560005", // magic suffix triggers 401
 		IdempotencyKey: "test-ref-401",
 	})
 
@@ -531,7 +531,7 @@ func TestNormalizeMSISDN(t *testing.T) {
 func TestAdapter_ConfigSchema(t *testing.T) {
 	adapter := NewAdapterWithClient(nil, "", "")
 	schema := adapter.ConfigSchema()
-	assert.NotNil(t, schema)
+	assert.Contains(t, schema, "\"properties\"")
 }
 
 func TestChargeRoundTrip(t *testing.T) {
@@ -542,10 +542,10 @@ func TestChargeRoundTrip(t *testing.T) {
 
 	// Step 1: Initiate payment
 	result, err := adapter.Initiate(context.Background(), gateways.InitiateRequest{
-		Amount:        gateways.Money{Amount: 500, Currency: "USD"},
-		Currency:      "USD",
-		MethodCode:    MethodEcoCash,
-		CustomerPhone: "0772123456",
+		Amount:         gateways.Money{Amount: 500, Currency: "USD"},
+		Currency:       "USD",
+		MethodCode:     MethodEcoCash,
+		CustomerPhone:  "0772123456",
 		IdempotencyKey: "roundtrip-001",
 	})
 	require.NoError(t, err)
@@ -583,10 +583,10 @@ func TestInitiateNetworkError(t *testing.T) {
 	adapter := NewAdapterWithClient(client, "", "")
 
 	_, err := adapter.Initiate(context.Background(), gateways.InitiateRequest{
-		Amount:        gateways.Money{Amount: 500, Currency: "USD"},
-		Currency:      "USD",
-		MethodCode:    MethodEcoCash,
-		CustomerPhone: "0772123456",
+		Amount:         gateways.Money{Amount: 500, Currency: "USD"},
+		Currency:       "USD",
+		MethodCode:     MethodEcoCash,
+		CustomerPhone:  "0772123456",
 		IdempotencyKey: "net-error-test",
 	})
 
@@ -668,7 +668,7 @@ func TestMultipleGatewaysInRegistry(t *testing.T) {
 
 	// Simulate what registry does
 	gateways := map[string]string{
-		"paynow": "paynow",
+		"paynow":  "paynow",
 		"ecocash": ecocashAdapter.Code(),
 	}
 	assert.Len(t, gateways, 2)

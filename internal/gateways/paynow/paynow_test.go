@@ -110,10 +110,10 @@ func TestAdapter_Initiate_Card(t *testing.T) {
 	adapter := NewAdapterWithClient(client)
 
 	result, err := adapter.Initiate(context.Background(), gateways.InitiateRequest{
-		Amount:       gateways.Money{Amount: 500, Currency: "USD"},
-		Currency:     "USD",
-		MethodCode:   MethodCard,
-		CustomerEmail: "test@example.com",
+		Amount:         gateways.Money{Amount: 500, Currency: "USD"},
+		Currency:       "USD",
+		MethodCode:     MethodCard,
+		CustomerEmail:  "test@example.com",
 		IdempotencyKey: "test-ref-001",
 	})
 
@@ -131,10 +131,10 @@ func TestAdapter_Initiate_EcoCash(t *testing.T) {
 	adapter := NewAdapterWithClient(client)
 
 	result, err := adapter.Initiate(context.Background(), gateways.InitiateRequest{
-		Amount:       gateways.Money{Amount: 500, Currency: "USD"},
-		Currency:     "USD",
-		MethodCode:   MethodEcoCash,
-		CustomerPhone: "0772123456",
+		Amount:         gateways.Money{Amount: 500, Currency: "USD"},
+		Currency:       "USD",
+		MethodCode:     MethodEcoCash,
+		CustomerPhone:  "0772123456",
 		IdempotencyKey: "test-ref-002",
 	})
 
@@ -311,8 +311,8 @@ func TestClient_generateHash(t *testing.T) {
 	client := NewClient("id", "test-key", "http://result", "http://return")
 
 	values := map[string]string{
-		"amount":   "5.00",
-		"id":       "123",
+		"amount":    "5.00",
+		"id":        "123",
 		"reference": "abc",
 	}
 
@@ -347,7 +347,7 @@ func TestClient_CheckStatus(t *testing.T) {
 func TestAdapter_ConfigSchema(t *testing.T) {
 	adapter := NewAdapter("id", "key", "http://result", "http://return")
 	schema := adapter.ConfigSchema()
-	assert.NotNil(t, schema)
+	assert.Contains(t, schema, "\"properties\"")
 }
 
 func TestAdapter_SupportedCurrencies(t *testing.T) {
@@ -394,10 +394,10 @@ func TestPINPromptSimulation(t *testing.T) {
 
 	// Step 1: Initiate EcoCash payment
 	result, err := adapter.Initiate(context.Background(), gateways.InitiateRequest{
-		Amount:        gateways.Money{Amount: 500, Currency: "USD"},
-		Currency:      "USD",
-		MethodCode:    MethodEcoCash,
-		CustomerPhone: "0772123456",
+		Amount:         gateways.Money{Amount: 500, Currency: "USD"},
+		Currency:       "USD",
+		MethodCode:     MethodEcoCash,
+		CustomerPhone:  "0772123456",
 		IdempotencyKey: "pin-test-001",
 	})
 	require.NoError(t, err)
@@ -454,10 +454,10 @@ func TestInitiateNetworkError(t *testing.T) {
 	adapter := NewAdapterWithClient(client)
 
 	_, err := adapter.Initiate(context.Background(), gateways.InitiateRequest{
-		Amount:        gateways.Money{Amount: 500, Currency: "USD"},
-		Currency:      "USD",
-		MethodCode:    MethodEcoCash,
-		CustomerPhone: "0772123456",
+		Amount:         gateways.Money{Amount: 500, Currency: "USD"},
+		Currency:       "USD",
+		MethodCode:     MethodEcoCash,
+		CustomerPhone:  "0772123456",
 		IdempotencyKey: "net-error-test",
 	})
 

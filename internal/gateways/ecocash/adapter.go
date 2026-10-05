@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/freeradius/payments-api/internal/gateways"
-	"github.com/xeipuuv/gojsonschema"
 )
 
 const GatewayCode = "ecocash"
@@ -35,9 +34,9 @@ type Adapter struct {
 func NewAdapter(apiKey, merchantCode, merchantPin, merchantNumber, terminalID, baseURL, notifyURL, returnURL string) *Adapter {
 	client := NewClient(apiKey, merchantCode, merchantPin, merchantNumber, terminalID, baseURL)
 	return &Adapter{
-		client:     client,
-		notifyURL:  notifyURL,
-		returnURL:  returnURL,
+		client:      client,
+		notifyURL:   notifyURL,
+		returnURL:   returnURL,
 		msisdnCache: make(map[string]string),
 	}
 }
@@ -45,9 +44,9 @@ func NewAdapter(apiKey, merchantCode, merchantPin, merchantNumber, terminalID, b
 // NewAdapterWithClient creates an adapter with a custom HTTP client (useful for testing).
 func NewAdapterWithClient(client *Client, notifyURL, returnURL string) *Adapter {
 	return &Adapter{
-		client:     client,
-		notifyURL:  notifyURL,
-		returnURL:  returnURL,
+		client:      client,
+		notifyURL:   notifyURL,
+		returnURL:   returnURL,
 		msisdnCache: make(map[string]string),
 	}
 }
@@ -81,7 +80,7 @@ func (a *Adapter) SupportedCurrencies() []string {
 }
 
 // ConfigSchema returns the JSON schema for gateway configuration.
-func (a *Adapter) ConfigSchema() *gojsonschema.Schema {
+func (a *Adapter) ConfigSchema() string {
 	schemaJSON := `{
 		"type": "object",
 		"properties": {
@@ -96,9 +95,7 @@ func (a *Adapter) ConfigSchema() *gojsonschema.Schema {
 		},
 		"required": ["api_key", "merchant_code", "merchant_pin", "merchant_number"]
 	}`
-	loader := gojsonschema.NewStringLoader(schemaJSON)
-	schema, _ := gojsonschema.NewSchema(loader)
-	return schema
+	return schemaJSON
 }
 
 // Initiate starts a new payment transaction with EcoCash.

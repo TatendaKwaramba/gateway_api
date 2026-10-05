@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,9 +20,13 @@ import (
 	"github.com/freeradius/payments-api/internal/gateways/mock"
 	"github.com/freeradius/payments-api/internal/gateways/paynow"
 	"github.com/freeradius/payments-api/internal/httpapi"
+	"github.com/freeradius/payments-api/internal/identity"
 	"github.com/freeradius/payments-api/internal/notify"
 	"github.com/freeradius/payments-api/internal/notify/africastalking"
+	"github.com/freeradius/payments-api/internal/notify/expo"
+	"github.com/freeradius/payments-api/internal/notify/mailgun"
 	notifymock "github.com/freeradius/payments-api/internal/notify/mock"
+	"github.com/freeradius/payments-api/internal/notify/smtp"
 	"github.com/freeradius/payments-api/internal/notify/twilio"
 	"github.com/freeradius/payments-api/internal/payments"
 	"github.com/freeradius/payments-api/internal/workers"
@@ -30,11 +35,17 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("payments-api startup failed", slog.Any("error", err))
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("failed to load configuration", slog.Any("error", err))
-		os.Exit(1)
+		return fmt.Errorf("load configuration: %w", err)
 	}
 
 	slog.Info("starting payments-api",
@@ -45,16 +56,14 @@ func main() {
 	// Connect to database
 	db, err := connectDB(cfg.DBDSN)
 	if err != nil {
-		slog.Error("failed to connect to database", slog.Any("error", err))
-		os.Exit(1)
+		return fmt.Errorf("connect to database: %w", err)
 	}
-	defer db.Close()
-
 	// Verify database connection
 	if err := db.Ping(); err != nil {
-		slog.Error("database ping failed", slog.Any("error", err))
-		os.Exit(1)
+		_ = db.Close()
+		return fmt.Errorf("database ping: %w", err)
 	}
+	defer db.Close()
 
 	slog.Info("database connected")
 
@@ -67,8 +76,7 @@ func main() {
 		mockAdapter := mock.NewAdapter(cfg.MockGatewayWebhookSecret, cfg.MockReturnURL)
 		mockAdapter.SetWebhookBaseURL(fmt.Sprintf("http://localhost:%d", cfg.Port))
 		if err := registry.Register(mockAdapter); err != nil {
-			slog.Error("failed to register mock gateway", slog.Any("error", err))
-			os.Exit(1)
+			return fmt.Errorf("register mock gateway: %w", err)
 		}
 
 		// In dev mode, register a mock adapter for the ecocash gateway when real
@@ -79,8 +87,7 @@ func main() {
 			ecocashMock := mock.NewAdapterWithCode("ecocash", cfg.MockGatewayWebhookSecret, cfg.MockReturnURL)
 			ecocashMock.SetWebhookBaseURL(fmt.Sprintf("http://localhost:%d", cfg.Port))
 			if err := registry.Register(ecocashMock); err != nil {
-				slog.Error("failed to register mock ecocash adapter", slog.Any("error", err))
-				os.Exit(1)
+				return fmt.Errorf("register mock ecocash adapter: %w", err)
 			}
 		}
 	}
@@ -95,8 +102,7 @@ func main() {
 			cfg.PaynowReturnURL,
 		)
 		if err := registry.Register(paynowAdapter); err != nil {
-			slog.Error("failed to register paynow gateway", slog.Any("error", err))
-			os.Exit(1)
+			return fmt.Errorf("register paynow gateway: %w", err)
 		}
 	}
 
@@ -114,8 +120,7 @@ func main() {
 			cfg.EcoCashReturnURL,
 		)
 		if err := registry.Register(ecocashAdapter); err != nil {
-			slog.Error("failed to register ecocash gateway", slog.Any("error", err))
-			os.Exit(1)
+			return fmt.Errorf("register ecocash gateway: %w", err)
 		}
 	}
 
@@ -125,27 +130,66 @@ func main() {
 	case "twilio":
 		p, err := twilio.NewTwilioProvider(cfg.TwilioAccountSID, cfg.TwilioAuthToken, cfg.TwilioPhoneNumber)
 		if err != nil {
-			slog.Error("failed to create twilio provider", slog.Any("error", err))
-			os.Exit(1)
+			return fmt.Errorf("create twilio provider: %w", err)
 		}
 		notificationProvider = p
 	case "africastalking", "at":
 		p, err := africastalking.NewATProvider(cfg.ATUsername, cfg.ATAPIKey)
 		if err != nil {
-			slog.Error("failed to create africastalking provider", slog.Any("error", err))
-			os.Exit(1)
+			return fmt.Errorf("create africastalking provider: %w", err)
 		}
 		notificationProvider = p
 	case "mock":
 		notificationProvider = notifymock.NewMockProvider()
 	default:
-		slog.Error("unknown notification provider", slog.String("provider", cfg.NotifyProvider))
-		os.Exit(1)
+		return fmt.Errorf("unknown notification provider %q", cfg.NotifyProvider)
 	}
 	slog.Info("notification provider configured", slog.String("provider", notificationProvider.Name()))
 
+	// Email provider (M-CIM): Mailgun HTTP API wins when configured; SMTP
+	// (Gmail submission etc.) remains the fallback for plain SMTP setups.
+	var emailProvider notify.Provider
+	switch {
+	case cfg.MailgunAPIKey != "":
+		emailProvider = mailgun.NewProvider(
+			cfg.MailgunAPIKey,
+			cfg.MailgunDomain,
+			fmt.Sprintf("Amani Connect <postmaster@%s>", cfg.MailgunDomain),
+			cfg.MailgunBaseURL,
+		)
+		slog.Info("email provider configured", slog.String("provider", emailProvider.Name()))
+	case cfg.SMTPHost != "":
+		emailProvider = smtp.NewProvider(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.SMTPFrom)
+		slog.Info("email provider configured", slog.String("provider", emailProvider.Name()))
+	}
+
+	// Mobile push sender (Expo)
+	var pushSender notify.PushSender
+	if cfg.ExpoPushEnabled {
+		pushSender = expo.NewProvider()
+		slog.Info("mobile push enabled", slog.String("provider", pushSender.Name()))
+	}
+
+	// Identity service (mobile OTP login + device registry); nil-safe when unconfigured
+	identityService := identity.NewService(db, notificationProvider, emailProvider, cfg.IdentityHMACSecret, cfg.SMTPFrom)
+	identityService.SetBrandName(cfg.BrandName)
+	identityService.SetEmailAccentColor(strings.TrimPrefix(cfg.EmailPrimaryColor, "#"))
+	identityService.SetPreviousSecret(cfg.IdentityHMACSecretPrevious)
+	identityService.SetDefaultOrgID(cfg.DefaultOrgID)
+	if googleIDs := parseClientIDs(cfg.GoogleClientIDs); googleIDs != nil {
+		if err := identityService.ConfigureGoogle(googleIDs, nil); err != nil {
+			slog.Error("identity: Google sign-in disabled (discovery failed)", slog.Any("error", err))
+		}
+	}
+	if identityService.Enabled() {
+		slog.Info("identity service enabled")
+	} else {
+		slog.Warn("identity service disabled (IDENTITY_HMAC_SECRET not configured)")
+	}
+
 	// Create fulfillment service
 	fulfillmentService := fulfillment.NewService(db, notificationProvider)
+	fulfillmentService.SetPushSender(pushSender, identityService)
 
 	// Create Django internal API client
 	djangoClient := django.NewClient(cfg.DjangoBaseURL, cfg.DjangoInternalAPIKey)
@@ -157,7 +201,7 @@ func main() {
 	adminAuth := httpapi.AdminHMACMiddleware(cfg.AdminHMACSecret)
 
 	// Create HTTP router
-	router := httpapi.NewRouter(paymentService, registry, adminAuth)
+	router := httpapi.NewRouter(paymentService, registry, adminAuth, identityService, fulfillmentService)
 	httpHandler := router.Setup()
 
 	// Create HTTP server
@@ -175,6 +219,7 @@ func main() {
 	defer poller.Stop()
 
 	notifRetry := workers.NewNotificationRetry(db, notificationProvider)
+	notifRetry.SetPushSender(pushSender, cfg.BrandName)
 	notifRetry.Start()
 	defer notifRetry.Stop()
 
@@ -203,6 +248,7 @@ func main() {
 	}
 
 	slog.Info("server stopped")
+	return nil
 }
 
 func connectDB(dsn string) (*sql.DB, error) {
@@ -218,4 +264,19 @@ func connectDB(dsn string) (*sql.DB, error) {
 	db.SetConnMaxIdleTime(5 * time.Minute)
 
 	return db, nil
+}
+
+// parseClientIDs splits a comma-separated OAuth audience allowlist
+func parseClientIDs(raw string) []string {
+	ids := []string{}
+	for _, id := range strings.Split(raw, ",") {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return ids
 }

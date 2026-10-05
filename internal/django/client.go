@@ -12,8 +12,8 @@ import (
 
 // Client calls Django internal APIs (e.g., CoA disconnect).
 type Client struct {
-	baseURL   string
-	apiKey    string
+	baseURL    string
+	apiKey     string
 	httpClient *http.Client
 }
 

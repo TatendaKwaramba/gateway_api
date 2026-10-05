@@ -23,18 +23,30 @@ const (
 
 // NotificationRetry drains failed notification attempts and retries them
 type NotificationRetry struct {
-	db       *sql.DB
-	notifier notify.Provider
-	ticker   *time.Ticker
-	stopChan chan struct{}
+	db        *sql.DB
+	notifier  notify.Provider
+	push      notify.PushSender
+	pushTitle string
+	ticker    *time.Ticker
+	stopChan  chan struct{}
 }
 
 // NewNotificationRetry creates a new notification retry worker
 func NewNotificationRetry(db *sql.DB, notifier notify.Provider) *NotificationRetry {
 	return &NotificationRetry{
-		db:       db,
-		notifier: notifier,
-		stopChan: make(chan struct{}),
+		db:        db,
+		notifier:  notifier,
+		pushTitle: "Amani Ecosystems",
+		stopChan:  make(chan struct{}),
+	}
+}
+
+// SetPushSender attaches optional mobile push support for retrying
+// channel='push' attempts; title is the user-visible notification title
+func (nr *NotificationRetry) SetPushSender(push notify.PushSender, title string) {
+	nr.push = push
+	if title != "" {
+		nr.pushTitle = title
 	}
 }
 
@@ -67,7 +79,7 @@ func (nr *NotificationRetry) loop() {
 func (nr *NotificationRetry) run(ctx context.Context) {
 	// Find failed notifications that are due for retry
 	rows, err := nr.db.QueryContext(ctx, `
-		SELECT id, transaction_id, recipient, body, retry_count
+		SELECT id, transaction_id, recipient, body, retry_count, channel
 		FROM notification_attempts
 		WHERE status = 'failed'
 		  AND retry_count < ?
@@ -85,16 +97,28 @@ func (nr *NotificationRetry) run(ctx context.Context) {
 	for rows.Next() {
 		var id int64
 		var transactionID int64
-		var recipient, body string
+		var recipient, body, channel string
 		var retryCount int
-		if err := rows.Scan(&id, &transactionID, &recipient, &body, &retryCount); err != nil {
+		if err := rows.Scan(&id, &transactionID, &recipient, &body, &retryCount, &channel); err != nil {
 			slog.Error("notification retry: scan error", slog.Any("error", err))
 			continue
 		}
 
-		err := nr.notifier.SendSMS(ctx, recipient, body)
+		var senderName string
+		var sendErr error
+		if channel == "push" {
+			if nr.push == nil {
+				// No push sender configured — leave for a worker that has one
+				continue
+			}
+			sendErr = nr.push.SendPush(ctx, recipient, nr.pushTitle, body, nil)
+			senderName = nr.push.Name()
+		} else {
+			sendErr = nr.notifier.SendSMS(ctx, recipient, body)
+			senderName = nr.notifier.Name()
+		}
 		status := "sent"
-		if err != nil {
+		if sendErr != nil {
 			status = "failed"
 		}
 
@@ -106,7 +130,7 @@ func (nr *NotificationRetry) run(ctx context.Context) {
 			    next_retry_at = ?, completed_at = CASE WHEN ? = 'sent' THEN NOW() ELSE NULL END,
 			    updated_at = NOW()
 			WHERE id = ?
-		`, status, nr.notifier.Name(), errToStr(err), nextRetry, status, id)
+		`, status, senderName, errToStr(sendErr), nextRetry, status, id)
 		if updateErr != nil {
 			slog.Error("notification retry: failed to update record",
 				slog.Int64("id", id),
@@ -114,7 +138,7 @@ func (nr *NotificationRetry) run(ctx context.Context) {
 			)
 		}
 
-		metrics.RecordNotificationAttempt(nr.notifier.Name(), status)
+		metrics.RecordNotificationAttempt(senderName, status)
 		retried++
 	}
 

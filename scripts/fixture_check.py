@@ -26,6 +26,10 @@ def extract_go_columns(fixture_path: str) -> dict[str, list[str]]:
     with open(fixture_path) as f:
         content = f.read()
 
+    # Normalize Go string concatenation used to embed backticked identifiers
+    # (e.g. `+"`key`"+`) so quoted column names parse as plain `key`.
+    content = re.sub(r'`\s*\+\s*"([^"]*)"\s*\+\s*`', r'\1', content)
+
     tables: dict[str, list[str]] = {}
     # Match: CREATE TABLE IF NOT EXISTS <table> ( ... );
     for m in re.finditer(
@@ -82,8 +86,8 @@ def extract_django_columns(django_path: str) -> dict[str, list[str]]:
             field_type = fm.group(2)
             if field_name in ('Meta', '__str__'):
                 continue
-            # ForeignKey creates <name>_id column
-            if field_type == 'ForeignKey':
+            # ForeignKey / OneToOneField create <name>_id columns
+            if field_type in ('ForeignKey', 'OneToOneField'):
                 columns.append(f'{field_name}_id')
             else:
                 columns.append(field_name)

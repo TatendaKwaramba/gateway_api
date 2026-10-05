@@ -16,19 +16,23 @@ import (
 
 	"github.com/freeradius/payments-api/internal/gateways"
 	"github.com/google/uuid"
-	"github.com/xeipuuv/gojsonschema"
+)
+
+const (
+	stateCompleted = "completed"
+	stateFailed    = "failed"
 )
 
 const (
 	// GatewayCode is the unique identifier for this gateway
 	GatewayCode = "mock"
-	
+
 	// Method codes
-	MethodInstant       = "mock-instant"
-	MethodEcoCash       = "mock-ecocash"
-	MethodCardRedirect  = "mock-card-redirect"
-	MethodSlow          = "mock-slow"
-	MethodFlaky         = "mock-flaky"
+	MethodInstant      = "mock-instant"
+	MethodEcoCash      = "mock-ecocash"
+	MethodCardRedirect = "mock-card-redirect"
+	MethodSlow         = "mock-slow"
+	MethodFlaky        = "mock-flaky"
 )
 
 // Adapter implements the gateways.Gateway interface for testing
@@ -37,7 +41,7 @@ type Adapter struct {
 	webhookSecret  string
 	returnURL      string
 	webhookBaseURL string
-	
+
 	// In-memory store for pending transactions (in production, this would be Redis/database)
 	transactions map[string]*Transaction
 }
@@ -63,10 +67,10 @@ func NewAdapter(webhookSecret, returnURL string) *Adapter {
 // This allows simulating other gateway workflows (e.g., "ecocash") during development.
 func NewAdapterWithCode(code, webhookSecret, returnURL string) *Adapter {
 	return &Adapter{
-		code:         code,
+		code:          code,
 		webhookSecret: webhookSecret,
-		returnURL:    returnURL,
-		transactions: make(map[string]*Transaction),
+		returnURL:     returnURL,
+		transactions:  make(map[string]*Transaction),
 	}
 }
 
@@ -118,7 +122,7 @@ func (a *Adapter) SupportedCurrencies() []string {
 }
 
 // ConfigSchema returns the JSON schema for configuration
-func (a *Adapter) ConfigSchema() *gojsonschema.Schema {
+func (a *Adapter) ConfigSchema() string {
 	schemaJSON := `{
 		"type": "object",
 		"properties": {
@@ -127,20 +131,18 @@ func (a *Adapter) ConfigSchema() *gojsonschema.Schema {
 		},
 		"required": ["webhook_secret"]
 	}`
-	
-	loader := gojsonschema.NewStringLoader(schemaJSON)
-	schema, _ := gojsonschema.NewSchema(loader)
-	return schema
+
+	return schemaJSON
 }
 
 // Initiate starts a new payment
 func (a *Adapter) Initiate(ctx context.Context, req gateways.InitiateRequest) (gateways.InitiateResult, error) {
 	// Generate external reference
 	externalRef := uuid.New().String()
-	
+
 	// Determine outcome based on magic values
 	outcome := a.determineOutcome(req.CustomerPhone, req.Amount.Amount)
-	
+
 	// Create transaction
 	tx := &Transaction{
 		ID:                uuid.New().String(),
@@ -151,43 +153,43 @@ func (a *Adapter) Initiate(ctx context.Context, req gateways.InitiateRequest) (g
 		CustomerPhone:     req.CustomerPhone,
 		CreatedAt:         time.Now(),
 	}
-	
+
 	a.transactions[externalRef] = tx
-	
+
 	// Handle immediate outcomes
 	result := gateways.InitiateResult{
 		ExternalReference: externalRef,
 		State:             "pending",
 	}
-	
+
 	switch outcome {
 	case "instant-success":
-		tx.State = "completed"
-		result.State = "completed"
+		tx.State = stateCompleted
+		result.State = stateCompleted
 		result.RedirectURL = ""
-		
+
 	case "instant-fail":
-		tx.State = "failed"
-		result.State = "failed"
+		tx.State = stateFailed
+		result.State = stateFailed
 		result.RedirectURL = ""
-		
+
 	case "network-error":
 		return gateways.InitiateResult{}, fmt.Errorf("network error: connection refused")
-		
+
 	case "slow-initiate":
 		// Simulate slow response
 		time.Sleep(10 * time.Second)
-		
+
 	default:
 		// Async methods - schedule webhook
 		go a.scheduleWebhook(externalRef, outcome)
-		
+
 		// Set redirect URL for redirect methods
 		if req.MethodCode == MethodCardRedirect {
 			result.RedirectURL = fmt.Sprintf("%s/mock/checkout/%s", a.returnURL, externalRef)
 		}
 	}
-	
+
 	return result, nil
 }
 
@@ -197,7 +199,7 @@ func (a *Adapter) Status(ctx context.Context, externalRef string) (gateways.Stat
 	if !ok {
 		return gateways.StatusResult{}, fmt.Errorf("transaction not found: %s", externalRef)
 	}
-	
+
 	return gateways.StatusResult{
 		State:    tx.State,
 		Amount:   tx.Amount,
@@ -212,30 +214,30 @@ func (a *Adapter) VerifyWebhook(ctx context.Context, headers http.Header, body [
 	if sig == "" {
 		return gateways.WebhookEvent{}, fmt.Errorf("missing X-Mock-Signature header")
 	}
-	
+
 	// Get timestamp from header
 	timestamp := headers.Get("X-Mock-Timestamp")
 	if timestamp == "" {
 		return gateways.WebhookEvent{}, fmt.Errorf("missing X-Mock-Timestamp header")
 	}
-	
+
 	// Verify timestamp is within 5 minute window
 	ts, err := strconv.ParseInt(timestamp, 10, 64)
 	if err != nil {
 		return gateways.WebhookEvent{}, fmt.Errorf("invalid timestamp: %w", err)
 	}
-	
+
 	now := time.Now().Unix()
 	if now-ts > 300 { // 5 minutes
 		return gateways.WebhookEvent{}, fmt.Errorf("webhook timestamp too old")
 	}
-	
+
 	// Verify signature
 	expectedSig := a.computeSignature(timestamp, body)
 	if !hmac.Equal([]byte(sig), []byte(expectedSig)) {
 		return gateways.WebhookEvent{}, fmt.Errorf("invalid signature")
 	}
-	
+
 	// Parse webhook payload
 	var payload struct {
 		ExternalReference string            `json:"external_reference"`
@@ -245,11 +247,11 @@ func (a *Adapter) VerifyWebhook(ctx context.Context, headers http.Header, body [
 		EventType         string            `json:"event_type"`
 		Metadata          map[string]string `json:"metadata"`
 	}
-	
+
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return gateways.WebhookEvent{}, fmt.Errorf("failed to parse webhook body: %w", err)
 	}
-	
+
 	return gateways.WebhookEvent{
 		ExternalReference: payload.ExternalReference,
 		State:             payload.State,
@@ -274,19 +276,19 @@ func (a *Adapter) Refund(ctx context.Context, externalRef string, amount gateway
 		)
 		return gateways.RefundResult{
 			ExternalReference: externalRef + "_refund",
-			State:             "completed",
+			State:             stateCompleted,
 		}, nil
 	}
-	
-	if tx.State != "completed" {
+
+	if tx.State != stateCompleted {
 		return gateways.RefundResult{}, fmt.Errorf("cannot refund transaction in state: %s", tx.State)
 	}
-	
+
 	tx.State = "refunded"
-	
+
 	return gateways.RefundResult{
 		ExternalReference: externalRef + "_refund",
-		State:             "completed",
+		State:             stateCompleted,
 	}, nil
 }
 
@@ -316,7 +318,7 @@ func (a *Adapter) determineOutcome(phone string, amountCents int64) string {
 			return "slow-initiate"
 		}
 	}
-	
+
 	// Amount decimal triggers
 	amountStr := fmt.Sprintf("%d", amountCents)
 	if strings.HasSuffix(amountStr, "13") {
@@ -325,7 +327,7 @@ func (a *Adapter) determineOutcome(phone string, amountCents int64) string {
 	if strings.HasSuffix(amountStr, "99") {
 		return "fulfillment-failure"
 	}
-	
+
 	// Default: async success after 3 seconds
 	return "async-success"
 }
@@ -336,23 +338,23 @@ func (a *Adapter) scheduleWebhook(externalRef, outcome string) {
 	var delay time.Duration
 	var finalState string
 	var eventType string
-	
+
 	switch outcome {
 	case "async-success":
 		delay = 3 * time.Second
-		finalState = "completed"
+		finalState = stateCompleted
 		eventType = "payment.completed"
 	case "fail-insufficient-funds":
 		delay = 2 * time.Second
-		finalState = "failed"
+		finalState = stateFailed
 		eventType = "payment.failed"
 	case "fail-declined":
 		delay = 2 * time.Second
-		finalState = "failed"
+		finalState = stateFailed
 		eventType = "payment.failed"
 	case "slow":
 		delay = 30 * time.Second
-		finalState = "completed"
+		finalState = stateCompleted
 		eventType = "payment.completed"
 	case "chargeback-simulation":
 		delay = 10 * time.Second
@@ -360,19 +362,19 @@ func (a *Adapter) scheduleWebhook(externalRef, outcome string) {
 		eventType = "payment.refunded"
 	default:
 		delay = 3 * time.Second
-		finalState = "completed"
+		finalState = stateCompleted
 		eventType = "payment.completed"
 	}
-	
+
 	// Schedule webhook
 	time.AfterFunc(delay, func() {
 		tx, ok := a.transactions[externalRef]
 		if !ok {
 			return
 		}
-		
+
 		tx.State = finalState
-		
+
 		// Deliver webhook if base URL is configured
 		if a.webhookBaseURL != "" {
 			a.deliverWebhook(tx, finalState, eventType)
@@ -390,15 +392,15 @@ func (a *Adapter) deliverWebhook(tx *Transaction, state, eventType string) {
 		"event_type":         eventType,
 		"metadata":           map[string]string{"source": "mock-gateway"},
 	}
-	
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
-	
+
 	timestamp := fmt.Sprintf("%d", time.Now().Unix())
 	sig := a.computeSignature(timestamp, body)
-	
+
 	webhookURL := fmt.Sprintf("%s/webhooks/%s", a.webhookBaseURL, a.code)
 	req, err := http.NewRequest(http.MethodPost, webhookURL, strings.NewReader(string(body)))
 	if err != nil {
@@ -407,7 +409,7 @@ func (a *Adapter) deliverWebhook(tx *Transaction, state, eventType string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Mock-Signature", sig)
 	req.Header.Set("X-Mock-Timestamp", timestamp)
-	
+
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -445,7 +447,7 @@ func (a *Adapter) CompleteTransaction(externalRef string) error {
 	if !ok {
 		return fmt.Errorf("transaction not found: %s", externalRef)
 	}
-	tx.State = "completed"
+	tx.State = stateCompleted
 	return nil
 }
 
@@ -455,7 +457,7 @@ func (a *Adapter) FailTransaction(externalRef string) error {
 	if !ok {
 		return fmt.Errorf("transaction not found: %s", externalRef)
 	}
-	tx.State = "failed"
+	tx.State = stateFailed
 	return nil
 }
 
@@ -465,7 +467,7 @@ func (a *Adapter) RefundTransaction(externalRef string) error {
 	if !ok {
 		return fmt.Errorf("transaction not found: %s", externalRef)
 	}
-	if tx.State != "completed" {
+	if tx.State != stateCompleted {
 		return fmt.Errorf("cannot refund transaction in state: %s", tx.State)
 	}
 	tx.State = "refunded"
@@ -480,13 +482,13 @@ func (a *Adapter) GetTransaction(externalRef string) (*Transaction, bool) {
 
 // TransactionListItem is a serializable summary of a mock transaction.
 type TransactionListItem struct {
-	ExternalReference string          `json:"external_reference"`
-	State             string          `json:"state"`
-	Amount            int64           `json:"amount"`
-	Currency          string          `json:"currency"`
-	MethodCode        string          `json:"method_code"`
-	CustomerPhone     string          `json:"customer_phone"`
-	CreatedAt         time.Time       `json:"created_at"`
+	ExternalReference string    `json:"external_reference"`
+	State             string    `json:"state"`
+	Amount            int64     `json:"amount"`
+	Currency          string    `json:"currency"`
+	MethodCode        string    `json:"method_code"`
+	CustomerPhone     string    `json:"customer_phone"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 // ListTransactions returns all transactions stored in the adapter.

@@ -10,6 +10,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+const labelMethod = "method"
+
 var (
 	// paymentsInitiatedTotal counts initiated payments by gateway and method
 	paymentsInitiatedTotal = promauto.NewCounterVec(
@@ -17,7 +19,7 @@ var (
 			Name: "payments_initiated_total",
 			Help: "Total number of initiated payments",
 		},
-		[]string{"gateway", "method"},
+		[]string{"gateway", labelMethod},
 	)
 
 	// paymentsCompletedTotal counts completed payments
@@ -107,7 +109,7 @@ var (
 			Name: "payments_http_requests_total",
 			Help: "Total HTTP requests to payments API",
 		},
-		[]string{"method", "endpoint", "status"},
+		[]string{labelMethod, "endpoint", "status"},
 	)
 
 	httpRequestDuration = promauto.NewHistogramVec(
@@ -116,7 +118,7 @@ var (
 			Help:    "HTTP request duration in seconds",
 			Buckets: []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0},
 		},
-		[]string{"method", "endpoint"},
+		[]string{labelMethod, "endpoint"},
 	)
 
 	httpRequestsInProgress = promauto.NewGaugeVec(
@@ -124,7 +126,7 @@ var (
 			Name: "payments_http_requests_in_progress",
 			Help: "Number of HTTP requests currently being processed",
 		},
-		[]string{"method", "endpoint"},
+		[]string{labelMethod, "endpoint"},
 	)
 )
 

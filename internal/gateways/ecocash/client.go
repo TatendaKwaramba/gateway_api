@@ -25,6 +25,8 @@ import (
 	"github.com/freeradius/payments-api/internal/gateways"
 )
 
+const statePending = "pending"
+
 const (
 	sandboxBaseURL    = "https://developers.ecocash.co.zw/sandbox"
 	productionBaseURL = "https://developers.ecocash.co.zw"
@@ -34,16 +36,16 @@ const (
 
 // Client is an HTTP client for the EcoCash API.
 type Client struct {
-	apiKey           string
-	merchantCode     string
-	merchantPin      string
-	merchantNumber   string
-	terminalID       string
+	apiKey            string
+	merchantCode      string
+	merchantPin       string
+	merchantNumber    string
+	terminalID        string
 	superMerchantName string
-	merchantName     string
-	httpClient       *http.Client
-	baseURL          string
-	basicAuthToken   string // base64(apiKey + ":" + merchantPin), computed once
+	merchantName      string
+	httpClient        *http.Client
+	baseURL           string
+	basicAuthToken    string // base64(apiKey + ":" + merchantPin), computed once
 }
 
 // NewClient creates a new EcoCash API client.
@@ -99,35 +101,35 @@ type ChargeMetaData struct {
 
 // ChargeRequest contains the parameters for initiating a C2B charge.
 type ChargeRequest struct {
-	ClientCorrelator      string           `json:"clientCorrelator"`
-	ReferenceCode         string           `json:"referenceCode"`
-	EndUserMSISN          string           `json:"endUserMSISN"`
-	TranType              string           `json:"tranType"`
-	Remarks               string           `json:"remarks"`
-	ChargingInformation   ChargingInformation `json:"chargingInformation"`
-	ChargeMetaData        ChargeMetaData   `json:"chargeMetaData"`
-	MerchantCode          string           `json:"merchantCode"`
-	MerchantPin           string           `json:"merchantPin"`
-	MerchantNumber        string           `json:"merchantNumber"`
-	CountryCode           string           `json:"countryCode"`
-	TerminalID            string           `json:"terminalID"`
-	NotifyURL             string           `json:"notifyUrl"`
-	SuperMerchantName     string           `json:"superMerchantName"`
-	MerchantName          string           `json:"merchantName"`
-	TransactionOperationStatus string      `json:"transactionOperationStatus"`
+	ClientCorrelator           string              `json:"clientCorrelator"`
+	ReferenceCode              string              `json:"referenceCode"`
+	EndUserMSISN               string              `json:"endUserMSISN"`
+	TranType                   string              `json:"tranType"`
+	Remarks                    string              `json:"remarks"`
+	ChargingInformation        ChargingInformation `json:"chargingInformation"`
+	ChargeMetaData             ChargeMetaData      `json:"chargeMetaData"`
+	MerchantCode               string              `json:"merchantCode"`
+	MerchantPin                string              `json:"merchantPin"`
+	MerchantNumber             string              `json:"merchantNumber"`
+	CountryCode                string              `json:"countryCode"`
+	TerminalID                 string              `json:"terminalID"`
+	NotifyURL                  string              `json:"notifyUrl"`
+	SuperMerchantName          string              `json:"superMerchantName"`
+	MerchantName               string              `json:"merchantName"`
+	TransactionOperationStatus string              `json:"transactionOperationStatus"`
 }
 
 // ChargeResponse contains the response from an EcoCash charge request.
 type ChargeResponse struct {
-	TransactionID     string `json:"transactionId"`
-	ClientCorrelator  string `json:"clientCorrelator"`
-	Status            string `json:"status"`
-	StatusMessage     string `json:"statusMessage"`
-	EcoCashRef        string `json:"ecocashRef"`
-	Currency          string `json:"currency"`
-	EndUserMSISN      string `json:"endUserMSISN"`
-	MerchantCode      string `json:"merchantCode"`
-	Timestamp         string `json:"timestamp"`
+	TransactionID    string `json:"transactionId"`
+	ClientCorrelator string `json:"clientCorrelator"`
+	Status           string `json:"status"`
+	StatusMessage    string `json:"statusMessage"`
+	EcoCashRef       string `json:"ecocashRef"`
+	Currency         string `json:"currency"`
+	EndUserMSISN     string `json:"endUserMSISN"`
+	MerchantCode     string `json:"merchantCode"`
+	Timestamp        string `json:"timestamp"`
 }
 
 // RefundRequest contains the parameters for a refund/reversal.
@@ -149,15 +151,15 @@ type RefundResponse struct {
 
 // LookupResponse contains the result of a transaction status lookup.
 type LookupResponse struct {
-	TransactionID     string `json:"transactionId"`
-	ClientCorrelator  string `json:"clientCorrelator"`
-	Status            string `json:"status"`
-	StatusMessage     string `json:"statusMessage"`
-	Currency          string `json:"currency"`
-	EndUserMSISN      string `json:"endUserMSISN"`
-	MerchantCode      string `json:"merchantCode"`
-	Amount            string `json:"amount"`
-	Timestamp         string `json:"timestamp"`
+	TransactionID    string `json:"transactionId"`
+	ClientCorrelator string `json:"clientCorrelator"`
+	Status           string `json:"status"`
+	StatusMessage    string `json:"statusMessage"`
+	Currency         string `json:"currency"`
+	EndUserMSISN     string `json:"endUserMSISN"`
+	MerchantCode     string `json:"merchantCode"`
+	Amount           string `json:"amount"`
+	Timestamp        string `json:"timestamp"`
 }
 
 // Charge sends a C2B charge request to EcoCash, initiating a USSD PIN push to the customer.
@@ -369,11 +371,11 @@ func (c *Client) VerifyWebhook(ctx context.Context, headers http.Header, body []
 
 	// Determine event type from status
 	status := strings.ToLower(webhook.Status)
-	eventType := "unknown"
+	var eventType string
 	switch status {
 	case "successful", "delivered":
 		eventType = "payment.completed"
-	case "pending", "initiated":
+	case statePending, "initiated":
 		eventType = "payment.status_update"
 	case "failed", "rejected":
 		eventType = "payment.failed"
@@ -407,8 +409,8 @@ func mapEcoCashStatus(status string) string {
 	switch strings.ToLower(status) {
 	case "successful", "delivered":
 		return "completed"
-	case "pending", "initiated":
-		return "pending"
+	case statePending, "initiated":
+		return statePending
 	case "failed", "rejected":
 		return "failed"
 	case "cancelled":
@@ -416,6 +418,6 @@ func mapEcoCashStatus(status string) string {
 	case "reversed":
 		return "refunded"
 	default:
-		return "pending"
+		return statePending
 	}
 }

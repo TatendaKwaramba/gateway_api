@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
-
-	"github.com/xeipuuv/gojsonschema"
 )
 
 // Money represents a monetary amount with currency
@@ -29,10 +27,10 @@ func (m Money) String() string {
 
 // Method represents a payment method supported by a gateway
 type Method struct {
-	Code        string `json:"code"`
-	DisplayName string `json:"display_name"`
-	RequiresPhone bool `json:"requires_phone"`
-	RequiresRedirect bool `json:"requires_redirect"`
+	Code             string `json:"code"`
+	DisplayName      string `json:"display_name"`
+	RequiresPhone    bool   `json:"requires_phone"`
+	RequiresRedirect bool   `json:"requires_redirect"`
 }
 
 // Capabilities describes what a gateway supports
@@ -46,14 +44,14 @@ type Capabilities struct {
 
 // InitiateRequest contains parameters for initiating a payment
 type InitiateRequest struct {
-	Amount       Money             `json:"amount"`
-	Currency     string            `json:"currency"`
-	MethodCode   string            `json:"method_code"`
-	CustomerEmail string           `json:"customer_email,omitempty"`
-	CustomerPhone string           `json:"customer_phone,omitempty"`
-	ReturnURL    string            `json:"return_url"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
-	IdempotencyKey string          `json:"idempotency_key,omitempty"`
+	Amount         Money             `json:"amount"`
+	Currency       string            `json:"currency"`
+	MethodCode     string            `json:"method_code"`
+	CustomerEmail  string            `json:"customer_email,omitempty"`
+	CustomerPhone  string            `json:"customer_phone,omitempty"`
+	ReturnURL      string            `json:"return_url"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+	IdempotencyKey string            `json:"idempotency_key,omitempty"`
 }
 
 // InitiateResult contains the result of initiating a payment
@@ -66,9 +64,9 @@ type InitiateResult struct {
 
 // StatusResult contains the current status of a payment
 type StatusResult struct {
-	State        string `json:"state"`
-	Amount       Money  `json:"amount"`
-	Currency     string `json:"currency"`
+	State         string `json:"state"`
+	Amount        Money  `json:"amount"`
+	Currency      string `json:"currency"`
 	FailureReason string `json:"failure_reason,omitempty"`
 }
 
@@ -92,28 +90,28 @@ type RefundResult struct {
 type Gateway interface {
 	// Code returns the unique code for this gateway (e.g., "mock", "paynow")
 	Code() string
-	
+
 	// Capabilities returns what this gateway supports
 	Capabilities() Capabilities
-	
+
 	// SupportedMethods returns the payment methods this gateway supports
 	SupportedMethods() []Method
-	
+
 	// SupportedCurrencies returns the ISO 4217 currency codes this gateway supports
 	SupportedCurrencies() []string
-	
+
 	// ConfigSchema returns the JSON schema for gateway configuration
-	ConfigSchema() *gojsonschema.Schema
-	
+	ConfigSchema() string
+
 	// Initiate starts a new payment transaction
 	Initiate(ctx context.Context, req InitiateRequest) (InitiateResult, error)
-	
+
 	// Status checks the current status of a transaction
 	Status(ctx context.Context, externalRef string) (StatusResult, error)
-	
+
 	// VerifyWebhook validates and parses a webhook request
 	VerifyWebhook(ctx context.Context, headers http.Header, body []byte) (WebhookEvent, error)
-	
+
 	// Refund processes a refund for a completed transaction
 	Refund(ctx context.Context, externalRef string, amount Money) (RefundResult, error)
 }
@@ -135,16 +133,16 @@ func NewRegistry() *Registry {
 func (r *Registry) Register(g Gateway) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	
+
 	code := g.Code()
 	if code == "" {
 		return fmt.Errorf("gateway code cannot be empty")
 	}
-	
+
 	if _, exists := r.gateways[code]; exists {
 		return fmt.Errorf("gateway with code %q already registered", code)
 	}
-	
+
 	r.gateways[code] = g
 	return nil
 }
@@ -153,7 +151,7 @@ func (r *Registry) Register(g Gateway) error {
 func (r *Registry) Resolve(code string) (Gateway, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	
+
 	g, ok := r.gateways[code]
 	return g, ok
 }
@@ -162,7 +160,7 @@ func (r *Registry) Resolve(code string) (Gateway, bool) {
 func (r *Registry) List() []Gateway {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	
+
 	list := make([]Gateway, 0, len(r.gateways))
 	for _, g := range r.gateways {
 		list = append(list, g)
@@ -177,12 +175,12 @@ func (r *Registry) AvailableMethods(currency string) []struct {
 } {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	
+
 	var methods []struct {
 		GatewayCode string `json:"gateway_code"`
 		Method      Method `json:"method"`
 	}
-	
+
 	for _, g := range r.gateways {
 		// Check if gateway supports the requested currency
 		if currency != "" {
@@ -197,7 +195,7 @@ func (r *Registry) AvailableMethods(currency string) []struct {
 				continue
 			}
 		}
-		
+
 		for _, m := range g.SupportedMethods() {
 			methods = append(methods, struct {
 				GatewayCode string `json:"gateway_code"`
@@ -208,7 +206,7 @@ func (r *Registry) AvailableMethods(currency string) []struct {
 			})
 		}
 	}
-	
+
 	return methods
 }
 
@@ -225,16 +223,14 @@ func (r *Registry) GetConfigSchema(code string) (ConfigSchemaJSON, bool) {
 	if !ok {
 		return ConfigSchemaJSON{}, false
 	}
-	
-	schema := g.ConfigSchema()
-	if schema == nil {
+
+	raw := g.ConfigSchema()
+	if raw == "" {
 		return ConfigSchemaJSON{Type: "object"}, true
 	}
-	
-	// Convert to JSON and back to get a clean map structure
-	jsonData, _ := json.Marshal(schema)
 	var result ConfigSchemaJSON
-	json.Unmarshal(jsonData, &result)
-	
+	if err := json.Unmarshal([]byte(raw), &result); err != nil || result.Type == "" {
+		return ConfigSchemaJSON{Type: "object"}, true
+	}
 	return result, true
 }

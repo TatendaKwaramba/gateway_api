@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -60,15 +61,25 @@ func (s *Service) fulfillSubscription(ctx context.Context, req FulfillRequest) (
 		&plan.VlanID,
 	)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("fulfillment: subscription plan %d not found", req.PlanID)
 		}
 		return nil, fmt.Errorf("fulfillment: query subscription plan: %w", err)
 	}
 
-	customerID, err := s.resolveOrCreateCustomer(ctx, req)
+	// M-CIM: unify buyer resolution — subscriptions attach to the same
+	// human customer as vouchers (identitylink-first, one row per buyer).
+	orgID := s.resolveOrganizationID(ctx, req)
+	customerID, err := s.EnsureBuyerCustomer(ctx, req, orgID)
 	if err != nil {
 		return nil, err
+	}
+	if customerID == 0 {
+		// Logged-in buyer with no contact typed at checkout (M-CIM).
+		customerID = req.OwnerCustomerID
+	}
+	if customerID == 0 {
+		return nil, fmt.Errorf("fulfillment: subscription requires customer phone or email")
 	}
 
 	now := time.Now()
@@ -83,7 +94,7 @@ func (s *Service) fulfillSubscription(ctx context.Context, req FulfillRequest) (
 	if err != nil {
 		return nil, fmt.Errorf("fulfillment: begin tx: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var poolID interface{}
 	if plan.DefaultPoolID.Valid {
@@ -151,7 +162,7 @@ func (s *Service) fulfillSubscription(ctx context.Context, req FulfillRequest) (
 	}
 
 	radreplyAttrs := []struct{ attr, value string }{
-		{"Reply-Message", "Cached by Flash API"},
+		{"Reply-Message", "Cached by Amani Ecosystems"},
 		{"Mikrotik-Rate-Limit", rateLimit},
 		{"Mikrotik-Recv-Limit", "1000000000000"},
 		{"Mikrotik-Xmit-Limit", "1000000000000"},
@@ -251,79 +262,8 @@ func (s *Service) fulfillSubscription(ctx context.Context, req FulfillRequest) (
 				slog.Any("error", notifyErr),
 			)
 		}
+		s.sendPushForPhone(ctx, req.TransactionID, req.CustomerPhone, "Subscription active", msgBody)
 	}
 
 	return &FulfillResult{Success: true}, nil
-}
-
-func (s *Service) resolveOrCreateCustomer(ctx context.Context, req FulfillRequest) (int64, error) {
-	if req.CustomerPhone == "" && req.CustomerEmail == "" {
-		return 0, fmt.Errorf("fulfillment: customer phone or email required for subscription")
-	}
-
-	var customerID int64
-	var lookupErr error
-
-	orgID, err := s.resolveOrganizationID(ctx, req)
-	if err != nil {
-		return 0, err
-	}
-	var orgVal interface{}
-	if orgID.Valid {
-		orgVal = orgID.Int64
-	}
-
-	if req.CustomerEmail != "" {
-		lookupErr = s.db.QueryRowContext(ctx, `
-			SELECT id FROM authentication_customer WHERE customer_email = ? LIMIT 1
-		`, req.CustomerEmail).Scan(&customerID)
-	}
-	if lookupErr == sql.ErrNoRows && req.CustomerPhone != "" {
-		lookupErr = s.db.QueryRowContext(ctx, `
-			SELECT id FROM authentication_customer WHERE customer_phone = ? LIMIT 1
-		`, req.CustomerPhone).Scan(&customerID)
-	}
-	if lookupErr == nil {
-		if orgID.Valid {
-			_, _ = s.db.ExecContext(ctx, `
-				UPDATE authentication_customer SET organization_id = ? WHERE id = ? AND organization_id IS NULL
-			`, orgID.Int64, customerID)
-		}
-		return customerID, nil
-	}
-	if lookupErr != sql.ErrNoRows {
-		return 0, fmt.Errorf("fulfillment: lookup customer: %w", lookupErr)
-	}
-
-	username := req.CustomerPhone
-	if username == "" {
-		username = req.CustomerEmail
-	}
-	customerCode := fmt.Sprintf("sub-%d", req.TransactionID)
-
-	// Resolve referral agent by referral link code (REF-XXXXXXXX from cookie)
-	var referredByVal interface{}
-	if req.ReferralCode != "" {
-		var agentID int64
-		if err := s.db.QueryRowContext(ctx, `
-			SELECT ap.id FROM sales_agentprofile ap
-			JOIN sales_referrallink rl ON rl.agent_id = ap.id
-			WHERE rl.code = ? AND rl.is_active = TRUE AND ap.status = 'active'
-			LIMIT 1
-		`, req.ReferralCode).Scan(&agentID); err == nil {
-			referredByVal = agentID
-		}
-	}
-
-	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO authentication_customer (
-			customer_id, customer_type, customer_name, customer_email, customer_phone,
-			customer_address, customer_city, customer_password, organization_id, referred_by_id,
-			radius_username, access_type, is_active, created_at, updated_at
-		) VALUES (?, 'subscriber', ?, ?, ?, 'Online checkout', 'N/A', ?, ?, ?, ?, 'subscription', TRUE, NOW(), NOW())
-	`, customerCode, username, req.CustomerEmail, req.CustomerPhone, username, orgVal, referredByVal, customerCode)
-	if err != nil {
-		return 0, fmt.Errorf("fulfillment: create customer: %w", err)
-	}
-	return res.LastInsertId()
 }

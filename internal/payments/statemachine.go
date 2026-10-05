@@ -35,8 +35,9 @@ func (s State) IsTerminal() bool {
 	switch s {
 	case StateCompleted, StateFailed, StateCancelled, StateRefunded:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 // String returns the string representation
@@ -56,7 +57,7 @@ func NewStateMachine() *StateMachine {
 		transitions: map[State][]State{
 			StateInitiated: {StatePending, StateCompleted, StateFailed, StateCancelled},
 			StatePending:   {StateCompleted, StateFailed, StateCancelled},
-			StateCompleted: {StateRefunded, StateFailed}, // Failed allows rollback on fulfillment error
+			StateCompleted: {StateRefunded, StateFailed}, // gateway-side corrections only; fulfillment errors keep `completed` (see triggerFulfillment)
 			StateFailed:    {},
 			StateCancelled: {},
 			StateRefunded:  {},
@@ -70,7 +71,7 @@ func (sm *StateMachine) CanTransition(from, to State) bool {
 	if !ok {
 		return false
 	}
-	
+
 	for _, s := range allowed {
 		if s == to {
 			return true
@@ -90,24 +91,24 @@ func (sm *StateMachine) Transition(ctx context.Context, db *sql.DB, transactionI
 	if !to.Valid() {
 		return false, fmt.Errorf("invalid target state: %s", to)
 	}
-	
+
 	// Same-state is always a no-op
 	if from == to {
 		return false, nil
 	}
-	
+
 	// Check if transition is valid
 	if !sm.CanTransition(from, to) {
 		return false, fmt.Errorf("invalid state transition: %s -> %s", from, to)
 	}
-	
+
 	// Attempt the transition in the database
 	// This is idempotent - if already in target state, no error
 	result, err := sm.applyTransition(ctx, db, transactionID, from, to)
 	if err != nil {
 		return false, fmt.Errorf("failed to apply transition: %w", err)
 	}
-	
+
 	return result, nil
 }
 
@@ -118,8 +119,8 @@ func (sm *StateMachine) applyTransition(ctx context.Context, db *sql.DB, transac
 	if err != nil {
 		return false, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
-	
+	defer func() { _ = tx.Rollback() }()
+
 	// Lock the row and get current state
 	var currentState string
 	var currentAmount int64
@@ -129,64 +130,62 @@ func (sm *StateMachine) applyTransition(ctx context.Context, db *sql.DB, transac
 		WHERE id = ? 
 		FOR UPDATE
 	`, transactionID).Scan(&currentState, &currentAmount)
-	
+
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, fmt.Errorf("transaction not found: %d", transactionID)
 		}
 		return false, fmt.Errorf("failed to query transaction: %w", err)
 	}
-	
+
 	// If already in target state, return false (no change needed)
 	if State(currentState) == to {
 		return false, nil
 	}
-	
+
 	// Verify we're transitioning from the expected state
 	if State(currentState) != from {
 		return false, fmt.Errorf("transaction state mismatch: expected %s, got %s", from, currentState)
 	}
-	
+
 	// Build update query
 	updateQuery := `
 		UPDATE payments_paymenttransaction 
 		SET state = ?, status = ?, updated_at = NOW()`
-	args := []interface{}{to.String(), to.String()}
-	
 	// Set completed_at for terminal success states
 	if to == StateCompleted {
 		updateQuery += `, completed_at = NOW()`
 	}
-	
+
 	updateQuery += ` WHERE id = ?`
-	args = append(args, transactionID)
-	
+	args := []interface{}{to.String(), to.String(), transactionID}
+
 	// Execute update
 	result, err := tx.ExecContext(ctx, updateQuery, args...)
 	if err != nil {
 		return false, fmt.Errorf("failed to update transaction state: %w", err)
 	}
-	
+
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("failed to get rows affected: %w", err)
 	}
-	
+
 	if rowsAffected != 1 {
 		return false, fmt.Errorf("unexpected rows affected: %d", rowsAffected)
 	}
-	
+
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("failed to commit transaction: %w", err)
 	}
-	
+
 	slog.Info("state transition applied",
 		slog.Int64("transaction_id", transactionID),
 		slog.String("from", from.String()),
 		slog.String("to", to.String()),
 	)
-	
+
 	return true, nil
 }
 
@@ -198,14 +197,14 @@ func (sm *StateMachine) GetState(ctx context.Context, db *sql.DB, transactionID 
 		FROM payments_paymenttransaction 
 		WHERE id = ?
 	`, transactionID).Scan(&state)
-	
+
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", fmt.Errorf("transaction not found: %d", transactionID)
 		}
 		return "", fmt.Errorf("failed to query state: %w", err)
 	}
-	
+
 	return State(state), nil
 }
 
@@ -220,7 +219,7 @@ func (sm *StateMachine) GetAllowedTransitions(from State) []State {
 	if !ok {
 		return nil
 	}
-	
+
 	// Return a copy to prevent external modification
 	result := make([]State, len(allowed))
 	copy(result, allowed)
@@ -229,19 +228,19 @@ func (sm *StateMachine) GetAllowedTransitions(from State) []State {
 
 // TransactionStateInfo contains state information for a transaction
 type TransactionStateInfo struct {
-	ID            int64     `json:"id"`
-	State         State     `json:"state"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
-	CompletedAt   *time.Time `json:"completed_at,omitempty"`
-	LastPolledAt  *time.Time `json:"last_polled_at,omitempty"`
+	ID           int64      `json:"id"`
+	State        State      `json:"state"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	CompletedAt  *time.Time `json:"completed_at,omitempty"`
+	LastPolledAt *time.Time `json:"last_polled_at,omitempty"`
 }
 
 // GetTransactionStateInfo retrieves full state information for a transaction
 func GetTransactionStateInfo(ctx context.Context, db *sql.DB, transactionID int64) (*TransactionStateInfo, error) {
 	var info TransactionStateInfo
 	var completedAt, lastPolledAt sql.NullTime
-	
+
 	err := db.QueryRowContext(ctx, `
 		SELECT id, state, created_at, updated_at, completed_at, last_polled_at
 		FROM payments_paymenttransaction 
@@ -254,20 +253,20 @@ func GetTransactionStateInfo(ctx context.Context, db *sql.DB, transactionID int6
 		&completedAt,
 		&lastPolledAt,
 	)
-	
+
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("transaction not found: %d", transactionID)
 		}
 		return nil, fmt.Errorf("failed to query transaction: %w", err)
 	}
-	
+
 	if completedAt.Valid {
 		info.CompletedAt = &completedAt.Time
 	}
 	if lastPolledAt.Valid {
 		info.LastPolledAt = &lastPolledAt.Time
 	}
-	
+
 	return &info, nil
 }

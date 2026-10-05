@@ -18,6 +18,18 @@ const (
 
 	// maxPollAge is the maximum age a transaction can be in pending state before being marked failed
 	maxPollAge = 30 * time.Minute
+
+	// fulfillmentRetryWindow is how long a captured-but-unfulfilled
+	// transaction stays eligible for automatic re-fulfillment.
+	fulfillmentRetryWindow = time.Hour
+
+	// fulfillmentRetryCooldown is the minimum gap between sweep picks for the
+	// same transaction (last_polled_at doubles as the marker — the gateway
+	// poller never touches completed rows).
+	fulfillmentRetryCooldown = 2 * time.Minute
+
+	// fulfillmentBatch caps how many stuck transactions one tick re-drives.
+	fulfillmentBatch = 10
 )
 
 // FulfillmentFunc is called when a transaction transitions to completed
@@ -25,12 +37,12 @@ type FulfillmentFunc func(transactionID int64)
 
 // Poller scans pending transactions and queries gateway status
 type Poller struct {
-	db               *sql.DB
-	registry         *gateways.Registry
-	sm               *payments.StateMachine
-	fulfillmentFunc  FulfillmentFunc
-	ticker           *time.Ticker
-	stopChan         chan struct{}
+	db              *sql.DB
+	registry        *gateways.Registry
+	sm              *payments.StateMachine
+	fulfillmentFunc FulfillmentFunc
+	ticker          *time.Ticker
+	stopChan        chan struct{}
 }
 
 // NewPoller creates a new poller worker
@@ -74,7 +86,7 @@ func (p *Poller) run(ctx context.Context) {
 	// Query transactions that are pending and haven't been polled in the last 30s,
 	// or are older than maxPollAge
 	rows, err := p.db.QueryContext(ctx, `
-		SELECT t.id, t.external_reference, g.gateway_code, t.state, t.created_at
+		SELECT t.id, t.external_reference, g.gateway_code, t.state
 		FROM payments_paymenttransaction t
 		JOIN payments_paymentgateway g ON g.id = t.gateway_id
 		WHERE t.state IN ('initiated', 'pending')
@@ -92,8 +104,7 @@ func (p *Poller) run(ctx context.Context) {
 		var transactionID int64
 		var externalRef sql.NullString
 		var gatewayCode, currentState string
-		var createdAt time.Time
-		if err := rows.Scan(&transactionID, &externalRef, &gatewayCode, &currentState, &createdAt); err != nil {
+		if err := rows.Scan(&transactionID, &externalRef, &gatewayCode, &currentState); err != nil {
 			slog.Error("poller: failed to scan row", slog.Any("error", err))
 			continue
 		}
@@ -102,8 +113,13 @@ func (p *Poller) run(ctx context.Context) {
 			externalRefStr = externalRef.String
 		}
 		checked++
-		p.processTransaction(ctx, transactionID, externalRefStr, gatewayCode, currentState, createdAt)
+		p.processTransaction(ctx, transactionID, externalRefStr, gatewayCode, currentState)
 	}
+
+	// Re-drive fulfillment for captured-but-unfulfilled transactions
+	// (restart recovery: the in-process retries in payments.Service do not
+	// survive a process crash or an outage longer than a few seconds).
+	p.retryUnfulfilled(ctx)
 
 	// Also mark any pending transactions older than maxPollAge as failed
 	p.timeoutOldTransactions(ctx)
@@ -111,7 +127,61 @@ func (p *Poller) run(ctx context.Context) {
 	metrics.RecordPollerRun(checked)
 }
 
-func (p *Poller) processTransaction(ctx context.Context, transactionID int64, externalRef, gatewayCode, currentState string, createdAt time.Time) {
+// retryUnfulfilled re-triggers fulfillment for recent completed transactions
+// that never got their fulfillment marker (voucher_pin NULL). Safe to call
+// repeatedly: Fulfill is idempotent and claim-locked per transaction.
+// `fulfillment_kind` is restricted to kinds that actually mark completion
+// that way — `topup` is a no-op and would otherwise be re-driven forever.
+func (p *Poller) retryUnfulfilled(ctx context.Context) {
+	if p.fulfillmentFunc == nil {
+		return
+	}
+	rows, err := p.db.QueryContext(ctx, `
+		SELECT id
+		FROM payments_paymenttransaction
+		WHERE state = 'completed'
+		  AND voucher_pin IS NULL
+		  AND fulfillment_kind IN ('voucher', 'subscription')
+		  AND completed_at > DATE_SUB(NOW(), INTERVAL ? SECOND)
+		  AND (last_polled_at IS NULL
+		       OR last_polled_at < DATE_SUB(NOW(), INTERVAL ? SECOND))
+		ORDER BY completed_at
+		LIMIT ?
+	`,
+		int64(fulfillmentRetryWindow.Seconds()),
+		int64(fulfillmentRetryCooldown.Seconds()),
+		fulfillmentBatch,
+	)
+	if err != nil {
+		slog.Error("poller: failed to query unfulfilled transactions", slog.Any("error", err))
+		return
+	}
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			slog.Error("poller: failed to scan unfulfilled transaction", slog.Any("error", err))
+			continue
+		}
+		ids = append(ids, id)
+	}
+	_ = rows.Close()
+
+	for _, id := range ids {
+		// Stamp the cooldown before triggering so a failing fulfillment is
+		// not re-picked on the very next tick.
+		_, _ = p.db.ExecContext(ctx, `
+			UPDATE payments_paymenttransaction SET last_polled_at = NOW() WHERE id = ?
+		`, id)
+		slog.Info("poller: retrying fulfillment for unfulfilled transaction",
+			slog.Int64("transaction_id", id),
+		)
+		p.triggerFulfillment(id)
+	}
+}
+
+func (p *Poller) processTransaction(ctx context.Context, transactionID int64, externalRef, gatewayCode, currentState string) {
 	// Update last_polled_at
 	_, _ = p.db.ExecContext(ctx, `
 		UPDATE payments_paymenttransaction SET last_polled_at = NOW() WHERE id = ?

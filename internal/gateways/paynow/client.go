@@ -127,10 +127,7 @@ func (c *Client) InitiateTransaction(ctx context.Context, req InitiateTransactio
 	}
 
 	// Parse JSON response
-	parsed, err := parseJSONResponse(body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
+	parsed := parseJSONResponse(body)
 
 	result := &InitiateTransactionResponse{
 		Status:          parsed["status"],
@@ -266,7 +263,7 @@ func (c *Client) VerifyWebhook(ctx context.Context, headers http.Header, body []
 
 	// Determine event type from status
 	status := strings.ToLower(parsed.Get("status"))
-	eventType := "unknown"
+	var eventType string
 	switch status {
 	case "paid", "delivered":
 		eventType = "payment.completed"
@@ -287,8 +284,8 @@ func (c *Client) VerifyWebhook(ctx context.Context, headers http.Header, body []
 		Currency:          parsed.Get("currency"),
 		EventType:         eventType,
 		Metadata: map[string]string{
-			"reference":   parsed.Get("reference"),
-			"status":      parsed.Get("status"),
+			"reference":       parsed.Get("reference"),
+			"status":          parsed.Get("status"),
 			"paynowreference": parsed.Get("paynowreference"),
 		},
 	}, nil
@@ -334,7 +331,7 @@ func (c *Client) VerifyHash(values map[string]string, expectedHash string) bool 
 
 // parseJSONResponse parses a simple JSON response into a flat string map.
 // Paynow returns very simple JSON objects; this avoids pulling in a JSON library.
-func parseJSONResponse(body []byte) (map[string]string, error) {
+func parseJSONResponse(body []byte) map[string]string {
 	result := make(map[string]string)
 
 	// Very lightweight JSON parser for Paynow's flat response format
@@ -342,7 +339,7 @@ func parseJSONResponse(body []byte) (map[string]string, error) {
 	text := string(body)
 	text = strings.TrimSpace(text)
 	if !strings.HasPrefix(text, "{") || !strings.HasSuffix(text, "}") {
-		return result, nil // Not a JSON object, return empty
+		return result // Not a JSON object, return empty
 	}
 
 	// Remove outer braces
@@ -368,7 +365,7 @@ func parseJSONResponse(body []byte) (map[string]string, error) {
 		result[key] = val
 	}
 
-	return result, nil
+	return result
 }
 
 // splitJSONPairs splits a flat JSON object string by top-level commas.

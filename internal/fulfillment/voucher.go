@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -23,7 +24,8 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 		Price         int64
 	}
 
-	if req.PlanID > 0 {
+	switch {
+	case req.PlanID > 0:
 		err := s.db.QueryRowContext(ctx, `
 			SELECT id, seconds, download_speed, upload_speed, max_sessions, price
 			FROM services_tariffplan
@@ -37,12 +39,12 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 			&tariffPlan.Price,
 		)
 		if err != nil {
-			if err == sql.ErrNoRows {
+			if errors.Is(err, sql.ErrNoRows) {
 				return nil, fmt.Errorf("fulfillment: tariff plan %d not found", req.PlanID)
 			}
 			return nil, fmt.Errorf("fulfillment: failed to query tariff plan: %w", err)
 		}
-	} else if req.DurationDays > 0 {
+	case req.DurationDays > 0:
 		// Dynamic hotspot pricing — no static plan matches the computed price.
 		// Use the first available active plan for speed/session defaults, then
 		// override seconds below with duration_days.
@@ -60,7 +62,7 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 			&tariffPlan.Price,
 		)
 		if err != nil {
-			if err == sql.ErrNoRows {
+			if errors.Is(err, sql.ErrNoRows) {
 				// No plans at all — use sensible defaults for a hotspot voucher.
 				tariffPlan = struct {
 					ID            int64
@@ -74,7 +76,7 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 				return nil, fmt.Errorf("fulfillment: failed to query tariff plan: %w", err)
 			}
 		}
-	} else {
+	default:
 		err := s.db.QueryRowContext(ctx, `
 			SELECT id, seconds, download_speed, upload_speed, max_sessions, price
 			FROM services_tariffplan
@@ -89,7 +91,7 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 			&tariffPlan.Price,
 		)
 		if err != nil {
-			if err == sql.ErrNoRows {
+			if errors.Is(err, sql.ErrNoRows) {
 				return nil, fmt.Errorf("fulfillment: no tariff plan found for price %d (minor units)", req.Amount)
 			}
 			return nil, fmt.Errorf("fulfillment: failed to query tariff plan: %w", err)
@@ -107,14 +109,27 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 		return nil, fmt.Errorf("fulfillment: failed to generate PIN: %w", err)
 	}
 
-	orgID, err := s.resolveOrganizationID(ctx, req)
+	orgID := s.resolveOrganizationID(ctx, req)
+
+	contactCustomerID, err := s.EnsureBuyerCustomer(ctx, req, orgID)
 	if err != nil {
 		return nil, err
 	}
-
-	customerID, err := s.ensureVoucherCustomer(ctx, req, pin, orgID)
-	if err != nil {
-		return nil, err
+	// Voucher owner: the checkout contact wins (typed SMS/PIN recipient),
+	// then the identity-stamped owner; both empty = anonymous voucher.
+	voucherCustomerID := interface{}(nil)
+	if contactCustomerID > 0 {
+		voucherCustomerID = contactCustomerID
+	} else if req.OwnerCustomerID > 0 {
+		voucherCustomerID = req.OwnerCustomerID
+	}
+	// Transaction owner: the identity customer first (M-CIM — purchases of a
+	// logged-in buyer stay in their history), else the contact customer.
+	txCustomerID := interface{}(nil)
+	if req.OwnerCustomerID > 0 {
+		txCustomerID = req.OwnerCustomerID
+	} else if contactCustomerID > 0 {
+		txCustomerID = contactCustomerID
 	}
 
 	timeLimit := time.Now().Add(time.Duration(tariffPlan.Seconds) * time.Second).Add(2 * time.Hour)
@@ -124,7 +139,7 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 	if err != nil {
 		return nil, fmt.Errorf("fulfillment: failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO radcheck (username, attribute, op, value)
@@ -154,7 +169,7 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 	}
 
 	radreplyAttrs := []struct{ attr, value string }{
-		{"Reply-Message", "Cached by Flash API"},
+		{"Reply-Message", "Cached by Amani Ecosystems"},
 		{"Mikrotik-Rate-Limit", rateLimit},
 		{"Mikrotik-Recv-Limit", "1000000000000"},
 		{"Mikrotik-Xmit-Limit", "1000000000000"},
@@ -191,16 +206,16 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 			voucher_pin, voucher_expired_date, voucher_response_message, voucher_status,
 			payment_transaction_id, created_by_id, updated_by_id, created_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, 1, NOW(), NOW())
-	`, radcheckID, tariffPlanID, customerID, tariffPlan.Price, pin, pin, timeLimit, "Payment voucher", req.TransactionID)
+	`, radcheckID, tariffPlanID, voucherCustomerID, tariffPlan.Price, pin, pin, timeLimit, "Payment voucher", req.TransactionID)
 	if err != nil {
 		return nil, fmt.Errorf("fulfillment: failed to insert voucher: %w", err)
 	}
 
 	_, err = tx.ExecContext(ctx, `
 		UPDATE payments_paymenttransaction
-		SET voucher_pin = ?, customer_id = ?, completed_at = NOW(), updated_at = NOW()
+		SET voucher_pin = ?, customer_id = COALESCE(?, customer_id), completed_at = NOW(), updated_at = NOW()
 		WHERE id = ?
-	`, pin, customerID, req.TransactionID)
+	`, pin, txCustomerID, req.TransactionID)
 	if err != nil {
 		return nil, fmt.Errorf("fulfillment: failed to update transaction: %w", err)
 	}
@@ -231,6 +246,7 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 			)
 			metrics.RecordFulfillmentFailure("voucher", "notification_failed")
 		}
+		s.sendPushForPhone(ctx, req.TransactionID, req.CustomerPhone, "Voucher ready", msgBody)
 	}
 
 	return &FulfillResult{
@@ -239,20 +255,16 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 	}, nil
 }
 
+//nolint:unparam // ctx is part of the fulfillment dispatcher signature.
 func (s *Service) fulfillTopup(ctx context.Context, req FulfillRequest) (*FulfillResult, error) {
 	return &FulfillResult{Success: true}, nil
 }
 
 func (s *Service) sendNotification(ctx context.Context, transactionID int64, to, body string) error {
-	result, err := s.db.ExecContext(ctx, `
-		INSERT INTO notification_attempts (
-			transaction_id, recipient, channel, body, status, retry_count, attempted_at
-		) VALUES (?, ?, 'sms', ?, 'pending', 0, NOW())
-	`, transactionID, to, body)
+	attemptID, err := s.insertNotificationAttempt(ctx, transactionID, to, "sms", body)
 	if err != nil {
-		return fmt.Errorf("failed to log notification attempt: %w", err)
+		return err
 	}
-	attemptID, _ := result.LastInsertId()
 
 	err = s.notifier.SendSMS(ctx, to, body)
 	status := "sent"
@@ -260,12 +272,7 @@ func (s *Service) sendNotification(ctx context.Context, transactionID int64, to,
 		status = "failed"
 	}
 
-	_, _ = s.db.ExecContext(ctx, `
-		UPDATE notification_attempts
-		SET status = ?, provider = ?, error = ?, completed_at = NOW()
-		WHERE id = ?
-	`, status, s.notifier.Name(), errToString(err), attemptID)
-
+	s.completeNotificationAttempt(ctx, attemptID, s.notifier.Name(), status, err)
 	return err
 }
 
@@ -303,9 +310,9 @@ func errToString(err error) string {
 	return err.Error()
 }
 
-func (s *Service) resolveOrganizationID(ctx context.Context, req FulfillRequest) (sql.NullInt64, error) {
+func (s *Service) resolveOrganizationID(ctx context.Context, req FulfillRequest) sql.NullInt64 {
 	if req.OrganizationID > 0 {
-		return sql.NullInt64{Int64: req.OrganizationID, Valid: true}, nil
+		return sql.NullInt64{Int64: req.OrganizationID, Valid: true}
 	}
 	if req.NasIPAddress != "" {
 		var orgID sql.NullInt64
@@ -314,7 +321,7 @@ func (s *Service) resolveOrganizationID(ctx context.Context, req FulfillRequest)
 			WHERE nas_ip_address = ? AND is_active = TRUE LIMIT 1
 		`, req.NasIPAddress).Scan(&orgID)
 		if err == nil && orgID.Valid {
-			return orgID, nil
+			return orgID
 		}
 	}
 	if req.NasIdentifier != "" {
@@ -324,63 +331,8 @@ func (s *Service) resolveOrganizationID(ctx context.Context, req FulfillRequest)
 			WHERE nas_identifier = ? AND is_active = TRUE LIMIT 1
 		`, req.NasIdentifier).Scan(&orgID)
 		if err == nil && orgID.Valid {
-			return orgID, nil
+			return orgID
 		}
 	}
-	return sql.NullInt64{}, nil
-}
-
-func (s *Service) ensureVoucherCustomer(
-	ctx context.Context,
-	req FulfillRequest,
-	pin string,
-	orgID sql.NullInt64,
-) (int64, error) {
-	email := fmt.Sprintf("%s@voucher.local", pin)
-	var customerID int64
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id FROM authentication_customer WHERE customer_email = ? LIMIT 1
-	`, email).Scan(&customerID)
-	if err == nil {
-		if orgID.Valid {
-			_, _ = s.db.ExecContext(ctx, `
-				UPDATE authentication_customer SET organization_id = ? WHERE id = ? AND organization_id IS NULL
-			`, orgID.Int64, customerID)
-		}
-		return customerID, nil
-	}
-	if err != sql.ErrNoRows {
-		return 0, fmt.Errorf("fulfillment: lookup voucher customer: %w", err)
-	}
-
-	var orgVal interface{}
-	if orgID.Valid {
-		orgVal = orgID.Int64
-	}
-
-	// Resolve referral agent by referral link code (REF-XXXXXXXX from cookie)
-	var referredByVal interface{}
-	if req.ReferralCode != "" {
-		var agentID int64
-		if err := s.db.QueryRowContext(ctx, `
-			SELECT ap.id FROM sales_agentprofile ap
-			JOIN sales_referrallink rl ON rl.agent_id = ap.id
-			WHERE rl.code = ? AND rl.is_active = TRUE AND ap.status = 'active'
-			LIMIT 1
-		`, req.ReferralCode).Scan(&agentID); err == nil {
-			referredByVal = agentID
-		}
-	}
-
-	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO authentication_customer (
-			customer_id, customer_type, customer_name, customer_email, customer_phone,
-			customer_address, customer_city, organization_id, referred_by_id,
-			radius_username, access_type, is_active, created_at, updated_at
-		) VALUES (?, 'voucher', ?, ?, ?, 'Payment voucher', 'N/A', ?, ?, ?, 'hotspot', TRUE, NOW(), NOW())
-	`, fmt.Sprintf("voucher-%d", req.TransactionID), pin, email, req.CustomerPhone, orgVal, referredByVal, pin)
-	if err != nil {
-		return 0, fmt.Errorf("fulfillment: create voucher customer: %w", err)
-	}
-	return res.LastInsertId()
+	return sql.NullInt64{}
 }

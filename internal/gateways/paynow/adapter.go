@@ -21,8 +21,9 @@ import (
 	"time"
 
 	"github.com/freeradius/payments-api/internal/gateways"
-	"github.com/xeipuuv/gojsonschema"
 )
+
+const statePending = "pending"
 
 const GatewayCode = "paynow"
 
@@ -48,7 +49,7 @@ type Adapter struct {
 // NewAdapter creates a new Paynow gateway adapter.
 func NewAdapter(integrationID, integrationKey, resultURL, returnURL string) *Adapter {
 	return &Adapter{
-		client: NewClient(integrationID, integrationKey, resultURL, returnURL),
+		client:   NewClient(integrationID, integrationKey, resultURL, returnURL),
 		pollURLs: make(map[string]string),
 	}
 }
@@ -93,7 +94,7 @@ func (a *Adapter) SupportedCurrencies() []string {
 }
 
 // ConfigSchema returns the JSON schema for gateway configuration.
-func (a *Adapter) ConfigSchema() *gojsonschema.Schema {
+func (a *Adapter) ConfigSchema() string {
 	schemaJSON := `{
 		"type": "object",
 		"properties": {
@@ -104,9 +105,7 @@ func (a *Adapter) ConfigSchema() *gojsonschema.Schema {
 		},
 		"required": ["integration_id", "integration_key", "result_url", "return_url"]
 	}`
-	loader := gojsonschema.NewStringLoader(schemaJSON)
-	schema, _ := gojsonschema.NewSchema(loader)
-	return schema
+	return schemaJSON
 }
 
 // Initiate starts a new payment transaction with Paynow.
@@ -155,9 +154,9 @@ func (a *Adapter) Initiate(ctx context.Context, req gateways.InitiateRequest) (g
 
 	result := gateways.InitiateResult{
 		ExternalReference: initiateResp.PaynowReference,
-		State:             "pending",
+		State:             statePending,
 		Metadata: map[string]string{
-			"poll_url": initiateResp.PollURL,
+			"poll_url":     initiateResp.PollURL,
 			"instructions": initiateResp.Instructions,
 		},
 	}
@@ -244,13 +243,13 @@ func mapPaynowStatus(paynowStatus string) string {
 	switch strings.ToLower(paynowStatus) {
 	case "paid", "delivered", "awaiting delivery":
 		return "completed"
-	case "created", "sent", "pending":
-		return "pending"
+	case "created", "sent", statePending:
+		return statePending
 	case "cancelled":
 		return "cancelled"
 	case "failed", "disputed", "refunded":
 		return "failed"
 	default:
-		return "pending"
+		return statePending
 	}
 }

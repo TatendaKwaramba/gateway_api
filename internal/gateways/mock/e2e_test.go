@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,12 +28,12 @@ import (
 // ---------------------------------------------------------------------------
 
 type e2eHarness struct {
-	db             *sql.DB
-	svc            *payments.Service
-	adapter        *Adapter
-	registry       *gateways.Registry
-	webhookSecret  string
-	cleanup        func()
+	db            *sql.DB
+	svc           *payments.Service
+	adapter       *Adapter
+	registry      *gateways.Registry
+	webhookSecret string
+	cleanup       func()
 }
 
 func newE2E(t *testing.T) *e2eHarness {
@@ -51,8 +52,11 @@ func newE2E(t *testing.T) *e2eHarness {
 	notifier := notifymock.NewMockProvider()
 	fulfillmentSvc := fulfillment.NewService(db, notifier)
 
-	// Empty Django client; CoA tests are unit-tested elsewhere
-	djangoClient := django.NewClient("", "")
+	// Django client pinned to a refused local port: the harness runs where
+	// flash-api DNS doesn't resolve, and the default fallback URL would stall
+	// each webhook path on a 10s+ TCP timeout before fulfillment runs.
+	// CoA behavior is unit-tested elsewhere.
+	djangoClient := django.NewClient("http://127.0.0.1:1", "")
 	paymentSvc := payments.NewService(db, registry, fulfillmentSvc, djangoClient, "USD")
 
 	return &e2eHarness{
@@ -94,18 +98,20 @@ func (h *e2eHarness) signWithTimestamp(body []byte, timestamp string) http.Heade
 	return headers
 }
 
-func (h *e2eHarness) waitForState(t *testing.T, txID int64, want string, maxWait time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(maxWait)
-	for time.Now().Before(deadline) {
-		resp, err := h.svc.GetStatus(context.Background(), txID)
-		require.NoError(t, err)
-		if resp.State == want {
-			return
+// waitVoucherPIN polls for fulfillment completion. Fulfillment runs after
+// the webhook state transition; timing depends on the host's TCP/DNS stack.
+func (h *e2eHarness) waitVoucherPIN(ctx context.Context, txID int64) *payments.GetStatusResponse {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		status, err := h.svc.GetStatus(ctx, txID)
+		if err == nil && status != nil && status.VoucherPIN != "" && !strings.HasPrefix(status.VoucherPIN, "sub:") {
+			return status
 		}
-		time.Sleep(150 * time.Millisecond)
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for state %s on tx %d", want, txID)
 }
 
 func (h *e2eHarness) queryRadcheckCount(pin string) int {
@@ -174,10 +180,14 @@ func TestE2E_AsyncSuccess_Webhook(t *testing.T) {
 	require.NoError(t, err)
 
 	// Assert DB state
-	status, err := h.svc.GetStatus(ctx, initResp.TransactionID)
-	require.NoError(t, err)
+	status := h.waitVoucherPIN(ctx, initResp.TransactionID)
+	if status == nil {
+		status, err = h.svc.GetStatus(ctx, initResp.TransactionID)
+		require.NoError(t, err)
+	}
+	require.NotNil(t, status)
 	assert.Equal(t, "completed", status.State)
-	assert.NotEmpty(t, status.VoucherPIN)
+	require.NotEmpty(t, status.VoucherPIN)
 
 	// Assert radcheck rows exist
 	assert.Equal(t, 2, h.queryRadcheckCount(status.VoucherPIN), "expected radcheck password + time-limit rows")
@@ -392,8 +402,8 @@ func TestE2E_WebhookReplay_Deduped(t *testing.T) {
 	err = h.svc.ProcessWebhook(ctx, "mock", event, body, headers)
 	require.NoError(t, err)
 
-	status1, err := h.svc.GetStatus(ctx, initResp.TransactionID)
-	require.NoError(t, err)
+	status1 := h.waitVoucherPIN(ctx, initResp.TransactionID)
+	require.NotNil(t, status1)
 	assert.Equal(t, "completed", status1.State)
 	pin1 := status1.VoucherPIN
 
@@ -485,7 +495,7 @@ func TestE2E_ChargebackSimulation(t *testing.T) {
 	assert.Equal(t, "refunded", status2.State)
 }
 
-func TestE2E_FulfillmentFailure_Rollback(t *testing.T) {
+func TestE2E_FulfillmentFailure_KeepsCompleted(t *testing.T) {
 	h := newE2E(t)
 	defer h.cleanup()
 	ctx := context.Background()
@@ -520,8 +530,9 @@ func TestE2E_FulfillmentFailure_Rollback(t *testing.T) {
 
 	status, err := h.svc.GetStatus(ctx, initResp.TransactionID)
 	require.NoError(t, err)
-	assert.Equal(t, "failed", status.State, "transaction should rollback to failed when fulfillment fails")
-	assert.Empty(t, status.VoucherPIN)
+	assert.Equal(t, "completed", status.State,
+		"money is captured: fulfillment failure must keep the transaction completed (retryable), not terminal failed")
+	assert.Empty(t, status.VoucherPIN, "no voucher issued for a failed fulfillment")
 }
 
 // ---------------------------------------------------------------------------

@@ -6,11 +6,11 @@ import (
 
 func TestPlanStruct_HasPlanType(t *testing.T) {
 	p := Plan{
-		ID:        1,
-		Name:      "Test Plan",
-		Price:     5000,
-		PlanType:  "subscription",
-		Currency:  "ZAR",
+		ID:       1,
+		Name:     "Test Plan",
+		Price:    5000,
+		PlanType: "subscription",
+		Currency: "ZAR",
 	}
 
 	if p.PlanType != "subscription" {
@@ -44,16 +44,16 @@ func TestPlanStruct_DisplayAmount(t *testing.T) {
 
 func TestPlanStruct_SubscriptionFields(t *testing.T) {
 	p := Plan{
-		ID:               1,
-		Name:             "PPPoE Standard",
-		Price:            5000,
-		Currency:         "ZAR",
-		DurationDays:     30,
-		DownloadSpeed:    10240,
-		UploadSpeed:      5120,
-		MaxSessions:      1,
-		FupDataQuotaMb:   0,
-		PlanType:         "subscription",
+		ID:             1,
+		Name:           "PPPoE Standard",
+		Price:          5000,
+		Currency:       "ZAR",
+		DurationDays:   30,
+		DownloadSpeed:  10240,
+		UploadSpeed:    5120,
+		MaxSessions:    1,
+		FupDataQuotaMb: 0,
+		PlanType:       "subscription",
 	}
 
 	if p.PlanType != "subscription" {

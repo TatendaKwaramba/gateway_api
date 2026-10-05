@@ -7,7 +7,7 @@ import (
 	"log"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/go-sql-driver/mysql" // registers the MySQL driver with database/sql
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
 )
@@ -81,12 +81,165 @@ func SetupTestDB() (*sql.DB, func(), error) {
 
 func createSchema(db *sql.DB) error {
 	schema := `
+CREATE TABLE IF NOT EXISTS radreply (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(64) NOT NULL,
+    attribute VARCHAR(64) NOT NULL,
+    op VARCHAR(2) NOT NULL,
+    value VARCHAR(253) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS radusergroup (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(64) NOT NULL,
+    groupname VARCHAR(64) NOT NULL,
+    priority INT DEFAULT 1,
+    UNIQUE KEY uq_group (username, groupname)
+);
+
+CREATE TABLE IF NOT EXISTS radacct (
+    acctsessionid VARCHAR(64) NOT NULL,
+    acctuniqueid VARCHAR(32) NOT NULL,
+    username VARCHAR(64),
+    nasipaddress VARCHAR(15) NOT NULL,
+    acctstarttime DATETIME NULL,
+    acctupdatetime DATETIME NULL,
+    acctstoptime DATETIME NULL,
+    acctsessiontime INT UNSIGNED DEFAULT 0,
+    acctinputoctets BIGINT UNSIGNED DEFAULT 0,
+    acctoutputoctets BIGINT UNSIGNED DEFAULT 0,
+    framedipaddress VARCHAR(15) DEFAULT '',
+    callingstationid VARCHAR(50),
+    acctterminatecause VARCHAR(32) DEFAULT '',
+    PRIMARY KEY (acctuniqueid),
+    KEY idx_username_start (username, acctstarttime)
+);
+
+CREATE TABLE IF NOT EXISTS known_macs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    mac VARCHAR(20) NOT NULL,
+    username VARCHAR(64),
+    expires DATETIME NULL,
+    customer BIGINT NULL,
+    organization BIGINT NULL,
+    download_speed INT DEFAULT 0,
+    upload_speed INT DEFAULT 0,
+    max_sessions INT DEFAULT 1,
+    last_seen DATETIME NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_mac (mac)
+);
+
+CREATE TABLE IF NOT EXISTS authentication_customer (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    customer_id VARCHAR(64) NOT NULL,
+    customer_type VARCHAR(30) DEFAULT 'subscriber',
+    customer_name VARCHAR(150) DEFAULT '',
+    customer_email VARCHAR(254),
+    customer_phone VARCHAR(20),
+    customer_address VARCHAR(255) DEFAULT '',
+    customer_city VARCHAR(100) DEFAULT 'N/A',
+    customer_password VARCHAR(128) DEFAULT '',
+    organization_id BIGINT NULL,
+    referred_by_id BIGINT NULL,
+    radius_username VARCHAR(64),
+    access_type VARCHAR(20) DEFAULT 'subscription',
+    is_active TINYINT(1) DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_customer_id (customer_id),
+    UNIQUE KEY uq_radius_username (radius_username)
+);
+
+CREATE TABLE IF NOT EXISTS authentication_identitylink (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    customer_id BIGINT NOT NULL,
+    kind VARCHAR(10) NOT NULL,
+    value VARCHAR(254) NOT NULL,
+    verified_at DATETIME(6) NOT NULL,
+    verified_via VARCHAR(12) DEFAULT 'otp',
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uq_kind_value (kind, value),
+    INDEX idx_customer (customer_id)
+);
+
+CREATE TABLE IF NOT EXISTS authentication_nasdevice (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    nas_name VARCHAR(100) DEFAULT '',
+    nas_ip_address VARCHAR(45),
+    nas_identifier VARCHAR(100),
+    nas_secret VARCHAR(255),
+    organization_id BIGINT NULL,
+    is_active TINYINT(1) DEFAULT 1,
+    UNIQUE KEY uq_nas_ip (nas_ip_address)
+);
+
+CREATE TABLE IF NOT EXISTS sales_agentprofile_referral_stub (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions_subscription (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    customer_id BIGINT NOT NULL,
+    plan_id BIGINT NOT NULL,
+    status VARCHAR(20) DEFAULT 'active',
+    start_date DATETIME,
+    end_date DATETIME,
+    auto_renew TINYINT(1) DEFAULT 1,
+    next_billing_date DATETIME,
+    framed_ip_pool_id BIGINT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_customer_status (customer_id, status)
+);
+
+CREATE TABLE IF NOT EXISTS services_subscriptionplan (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100),
+    billing_period_days INT DEFAULT 30,
+    download_speed INT DEFAULT 5000,
+    upload_speed INT DEFAULT 2000,
+    price_minor BIGINT DEFAULT 0,
+    currency VARCHAR(3) DEFAULT 'ZAR',
+    default_framed_ip_pool_id BIGINT NULL,
+    vlan_id BIGINT NULL,
+    is_active TINYINT(1) DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS billing_billingplan (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100),
+    price_minor BIGINT DEFAULT 0,
+    currency VARCHAR(3) DEFAULT 'ZAR',
+    policy_summary JSON
+);
+
+CREATE TABLE IF NOT EXISTS ipam_ippool (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100),
+    organization_id BIGINT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sales_agentprofile (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    status VARCHAR(20) DEFAULT 'active'
+);
+
+CREATE TABLE IF NOT EXISTS sales_referrallink (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    agent_id BIGINT,
+    code VARCHAR(60),
+    is_active TINYINT(1) DEFAULT 1
+);
+
 CREATE TABLE IF NOT EXISTS payments_paymentgateway (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(100) NOT NULL,
     gateway_code VARCHAR(50) NOT NULL UNIQUE,
     description TEXT,
     configuration JSON DEFAULT ('{}'),
+    organization_id BIGINT NULL,
     is_active TINYINT(1) DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -123,6 +276,9 @@ CREATE TABLE IF NOT EXISTS payments_paymenttransaction (
     gateway_response JSON DEFAULT ('{}'),
     idempotency_key VARCHAR(255) UNIQUE,
     fulfillment_kind VARCHAR(20) DEFAULT 'voucher',
+    organization_id BIGINT NULL,
+    fee_amount DECIMAL(10,2) NULL,
+    net_amount DECIMAL(10,2) NULL,
     voucher_pin VARCHAR(16),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -152,10 +308,58 @@ CREATE TABLE IF NOT EXISTS payments_paymentwebhooklog (
 
 CREATE TABLE IF NOT EXISTS payments_idempotency_key (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    `key` VARCHAR(255) NOT NULL UNIQUE,
+    ` + "`key`" + ` VARCHAR(255) NOT NULL UNIQUE,
     request_hash VARCHAR(64) NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_key (`key`)
+    INDEX idx_key (` + "`key`" + `)
+);
+
+CREATE TABLE IF NOT EXISTS payments_pushdevice (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    identity_phone VARCHAR(254),
+    identity_email VARCHAR(254),
+    expo_token VARCHAR(255) NOT NULL UNIQUE,
+    platform VARCHAR(20),
+    organization_id BIGINT NULL,
+    enabled TINYINT(1) DEFAULT 1,
+    last_seen_at DATETIME NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_phone_enabled (identity_phone, enabled)
+);
+
+CREATE TABLE IF NOT EXISTS payments_identity_account (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    customer_id BIGINT NOT NULL UNIQUE,
+    password_hash VARCHAR(200) NOT NULL,
+    failed_attempts INT UNSIGNED DEFAULT 0,
+    locked_until DATETIME NULL,
+    password_set_at DATETIME(6) NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS payments_identity_revocation (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    phone VARCHAR(254),
+    email VARCHAR(254),
+    reason VARCHAR(100) DEFAULT '',
+    revoked_by VARCHAR(150) DEFAULT '',
+    revoked_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+    INDEX idx_phone_revoked (phone, revoked_at),
+    INDEX idx_email_revoked (email, revoked_at)
+);
+
+CREATE TABLE IF NOT EXISTS payments_otptoken (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    channel VARCHAR(10) NOT NULL,
+    recipient VARCHAR(254) NOT NULL,
+    code_hash CHAR(64) NOT NULL,
+    attempts SMALLINT UNSIGNED DEFAULT 0,
+    expires_at DATETIME NOT NULL,
+    consumed_at DATETIME NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_recipient_expires (recipient, expires_at)
 );
 
 CREATE TABLE IF NOT EXISTS payments_webhook_replay_log (
@@ -257,6 +461,7 @@ CREATE TABLE IF NOT EXISTS vouchers_voucher (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     radcheck_id BIGINT NOT NULL,
     tariff_plan_id BIGINT,
+    customer_id BIGINT NULL,
     voucher_amount INT DEFAULT 0,
     voucher_serial_number VARCHAR(64),
     voucher_pin VARCHAR(64),
@@ -284,7 +489,6 @@ func seedFixtures(db *sql.DB) error {
 		return fmt.Errorf("insert mock gateway: %w", err)
 	}
 
-	// Seed mock payment methods
 	_, err = db.Exec(`
 		INSERT INTO payments_paymentmethod (gateway_id, method_code, display_name, display_order, metadata, is_active)
 		VALUES 
@@ -306,6 +510,15 @@ func seedFixtures(db *sql.DB) error {
 		return fmt.Errorf("insert currency: %w", err)
 	}
 
+	zarUSDRes, err := db.Exec(`
+		INSERT INTO services_supportedcurrency (code, name, symbol, is_active, is_default)
+		VALUES ('USD', 'US Dollar', '$', 1, 0)
+	`)
+	if err != nil {
+		return fmt.Errorf("insert USD currency: %w", err)
+	}
+	usdID, _ := zarUSDRes.LastInsertId()
+
 	_, err = db.Exec(`
 		INSERT INTO services_hotspotdaypolicy (name, currency_id, is_active)
 		VALUES ('default', 1, 1)
@@ -316,8 +529,8 @@ func seedFixtures(db *sql.DB) error {
 
 	_, err = db.Exec(`
 		INSERT INTO payments_gatewaysupportedcurrency (gateway_id, currency_id, is_active)
-		VALUES (1, 1, 1)
-	`)
+		VALUES (1, 1, 1), (1, ?, 1)  -- ZAR and USD supported by the mock gateway
+	`, usdID)
 	if err != nil {
 		return fmt.Errorf("insert gateway currency: %w", err)
 	}

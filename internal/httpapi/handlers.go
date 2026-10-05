@@ -4,17 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/freeradius/payments-api/internal/gateways"
 	"github.com/freeradius/payments-api/internal/gateways/mock"
+	"github.com/freeradius/payments-api/internal/identity"
 	"github.com/freeradius/payments-api/internal/metrics"
 	"github.com/freeradius/payments-api/internal/payments"
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 )
 
 // listPlans returns active tariff plans
@@ -83,19 +87,22 @@ func (r *Router) listPaymentMethods(w http.ResponseWriter, req *http.Request) {
 
 // initiatePaymentRequest represents a payment initiation request
 type initiatePaymentRequest struct {
-	GatewayCode      string            `json:"gateway_code"`
-	GatewayID        *int64            `json:"gateway_id,omitempty"` // F3.8: explicit org-scoped gateway
-	MethodCode       string            `json:"method_code"`
-	Amount           int64             `json:"amount"`
-	Currency         string            `json:"currency"`
-	PlanID           *int64            `json:"plan_id,omitempty"`
-	DurationDays     *int64            `json:"duration_days,omitempty"`
-	CustomerEmail    string            `json:"customer_email,omitempty"`
-	CustomerPhone    string            `json:"customer_phone,omitempty"`
-	CustomerID       *int64            `json:"customer_id,omitempty"`
-	FulfillmentKind  string            `json:"fulfillment_kind,omitempty"`
-	Metadata         map[string]string `json:"metadata,omitempty"`
-	IdempotencyKey   string            `json:"idempotency_key,omitempty"`
+	GatewayCode   string `json:"gateway_code"`
+	GatewayID     *int64 `json:"gateway_id,omitempty"` // F3.8: explicit org-scoped gateway
+	MethodCode    string `json:"method_code"`
+	Amount        int64  `json:"amount"`
+	Currency      string `json:"currency"`
+	PlanID        *int64 `json:"plan_id,omitempty"`
+	DurationDays  *int64 `json:"duration_days,omitempty"`
+	CustomerEmail string `json:"customer_email,omitempty"`
+	CustomerPhone string `json:"customer_phone,omitempty"`
+	// customer_id is deliberately not accepted here: a caller-supplied owner
+	// would let anyone stamp ownership of a payment onto another customer's
+	// record. Ownership comes only from the verified identity token
+	// (OwnerCustomerID / OwnerContacts), which the handler derives itself.
+	FulfillmentKind string            `json:"fulfillment_kind,omitempty"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
+	IdempotencyKey  string            `json:"idempotency_key,omitempty"`
 }
 
 // initiatePayment handles payment initiation
@@ -105,54 +112,152 @@ func (r *Router) initiatePayment(w http.ResponseWriter, req *http.Request) {
 		respondError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	
-	// Validate required fields
-	if reqBody.GatewayCode == "" && reqBody.GatewayID == nil {
-		respondError(w, http.StatusBadRequest, "gateway_code or gateway_id is required")
-		return
+
+	// M-CIM: logged-in buyers stamp ownership at initiate time — anonymous
+	// checkout remains unchanged (tolerated when identity is disabled/unset).
+	// The revocation lookup fails closed: an error must never be read as
+	// "not revoked" and stamp a revoked identity's ownership onto a payment.
+	var identityV identity.ValidatedToken
+	hasIdentity := false
+	if holder, err := r.identityBearerFull(req); err == nil {
+		revoked, revErr := r.identity.IdentityRevoked(req.Context(), holder.Identity, holder.IssuedAt)
+		switch {
+		case revErr != nil:
+			slog.Error("initiate: revocation check failed", slog.Any("error", revErr))
+		case !revoked:
+			identityV = holder
+			hasIdentity = true
+		}
 	}
-	if reqBody.Amount <= 0 {
-		respondError(w, http.StatusBadRequest, "amount must be positive")
-		return
-	}
-	if reqBody.Currency == "" {
-		respondError(w, http.StatusBadRequest, "currency is required")
-		return
-	}
-	
+
 	// Initiate payment
+	var ownerCustomerID *int64
+	var ownerContacts *payments.IdentityContact
+	if hasIdentity {
+		if ownerIDs := r.identity.LinkedCustomerIDs(req.Context(), identityV.Identity); len(ownerIDs) > 0 {
+			ownerCustomerID = &ownerIDs[0]
+		}
+		if ownerCustomerID == nil {
+			// Verified contact with no claimed customer yet: pass contacts so
+			// the fulfillment buyer path claims ownership at fulfillment time.
+			ownerContacts = &payments.IdentityContact{
+				Phone: identityV.Identity.Phone,
+				Email: identityV.Identity.Email,
+			}
+		}
+	}
+
 	result, err := r.paymentService.Initiate(req.Context(), payments.InitiateRequest{
-		GatewayCode:      reqBody.GatewayCode,
-		GatewayID:        reqBody.GatewayID,
-		MethodCode:       reqBody.MethodCode,
-		Amount:           reqBody.Amount,
-		Currency:         reqBody.Currency,
-		PlanID:           reqBody.PlanID,
-		DurationDays:     reqBody.DurationDays,
-		CustomerEmail:    reqBody.CustomerEmail,
-		CustomerPhone:    reqBody.CustomerPhone,
-		CustomerID:       reqBody.CustomerID,
-		FulfillmentKind:  reqBody.FulfillmentKind,
-		Metadata:         reqBody.Metadata,
-		IdempotencyKey:   reqBody.IdempotencyKey,
+		GatewayCode:     reqBody.GatewayCode,
+		GatewayID:       reqBody.GatewayID,
+		MethodCode:      reqBody.MethodCode,
+		Amount:          reqBody.Amount,
+		Currency:        reqBody.Currency,
+		PlanID:          reqBody.PlanID,
+		DurationDays:    reqBody.DurationDays,
+		CustomerEmail:   reqBody.CustomerEmail,
+		CustomerPhone:   reqBody.CustomerPhone,
+		FulfillmentKind: reqBody.FulfillmentKind,
+		Metadata:        reqBody.Metadata,
+		IdempotencyKey:  reqBody.IdempotencyKey,
+		OwnerCustomerID: ownerCustomerID,
+		OwnerContacts:   ownerContacts,
 	})
-	
+
 	if err != nil {
 		slog.Error("failed to initiate payment", slog.Any("error", err))
 		respondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	
+
 	respondJSON(w, http.StatusOK, result)
+}
+
+// authorizeTransaction resolves the {transaction_id} path parameter and
+// enforces read access to the payment.
+//
+// The reference is either the public UUID (returned to the payer by
+// POST /payments/initiate) or the numeric database id:
+//
+//   - UUID — a capability: it is unguessable and only handed to the party
+//     that initiated the payment, so polling works with no identity at all
+//     (anonymous checkout in both the mobile app and the web funnel).
+//   - numeric id — sequential, therefore NOT a capability: it requires a
+//     valid, non-revoked identity token that owns the transaction (same
+//     matching rules as GET /payments history).
+//
+// Every denial is a uniform 404 (no existence oracle) except a supplied but
+// invalid/expired/revoked token, which is 401 so clients can re-authenticate.
+// This endpoint returns voucher PINs and buyer contacts, so it must never be
+// reachable by id enumeration.
+func (r *Router) authorizeTransaction(w http.ResponseWriter, req *http.Request) (int64, bool) {
+	ref := chi.URLParam(req, "transaction_id")
+
+	// UUID reference: possession is the authorization.
+	if _, err := uuid.Parse(ref); err == nil {
+		transactionID, err := r.paymentService.ResolveTransactionID(req.Context(), ref)
+		if err != nil {
+			respondError(w, http.StatusNotFound, "transaction not found")
+			return 0, false
+		}
+		return transactionID, true
+	}
+
+	// Anything else must be a positive numeric id, backed by an owner identity.
+	transactionID, err := strconv.ParseInt(ref, 10, 64)
+	if err != nil || transactionID <= 0 {
+		respondError(w, http.StatusNotFound, "transaction not found")
+		return 0, false
+	}
+
+	if !r.identity.Enabled() {
+		respondError(w, http.StatusNotFound, "transaction not found")
+		return 0, false
+	}
+	if strings.TrimSpace(req.Header.Get("Authorization")) == "" {
+		respondError(w, http.StatusNotFound, "transaction not found")
+		return 0, false
+	}
+	validated, err := r.identityBearerFull(req)
+	if err != nil {
+		respondError(w, http.StatusUnauthorized, "valid Bearer identity token required")
+		return 0, false
+	}
+	revoked, err := r.identity.IdentityRevoked(req.Context(), validated.Identity, validated.IssuedAt)
+	if err != nil {
+		// Fail closed: a lookup failure must not grant access.
+		slog.Error("transaction access: revocation check failed", slog.Any("error", err))
+		respondError(w, http.StatusNotFound, "transaction not found")
+		return 0, false
+	}
+	if revoked {
+		respondError(w, http.StatusUnauthorized, "identity revoked, sign in again")
+		return 0, false
+	}
+
+	customerIDs := r.identity.LinkedCustomerIDs(req.Context(), validated.Identity)
+	allowed, err := r.paymentService.CanAccessTransaction(
+		req.Context(), transactionID,
+		validated.Identity.Phone, validated.Identity.Email, customerIDs,
+	)
+	if err != nil {
+		slog.Error("transaction access check failed",
+			slog.Int64("transaction_id", transactionID),
+			slog.Any("error", err))
+		respondError(w, http.StatusNotFound, "transaction not found")
+		return 0, false
+	}
+	if !allowed {
+		respondError(w, http.StatusNotFound, "transaction not found")
+		return 0, false
+	}
+	return transactionID, true
 }
 
 // pollPaymentStatus triggers a manual poll of the gateway status
 func (r *Router) pollPaymentStatus(w http.ResponseWriter, req *http.Request) {
-	transactionIDStr := chi.URLParam(req, "transaction_id")
-
-	transactionID, err := strconv.ParseInt(transactionIDStr, 10, 64)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid transaction_id format")
+	transactionID, ok := r.authorizeTransaction(w, req)
+	if !ok {
 		return
 	}
 
@@ -168,37 +273,32 @@ func (r *Router) pollPaymentStatus(w http.ResponseWriter, req *http.Request) {
 
 // getPaymentStatus returns the status of a payment
 func (r *Router) getPaymentStatus(w http.ResponseWriter, req *http.Request) {
-	transactionIDStr := chi.URLParam(req, "transaction_id")
-	
-	// Try to parse as integer first (database ID)
-	transactionID, err := strconv.ParseInt(transactionIDStr, 10, 64)
-	if err != nil {
-		// If not an integer, it might be the UUID string - we'd need to look it up
-		respondError(w, http.StatusBadRequest, "invalid transaction_id format")
+	transactionID, ok := r.authorizeTransaction(w, req)
+	if !ok {
 		return
 	}
-	
+
 	status, err := r.paymentService.GetStatus(req.Context(), transactionID)
 	if err != nil {
 		slog.Error("failed to get payment status", slog.Any("error", err))
 		respondError(w, http.StatusNotFound, "transaction not found")
 		return
 	}
-	
+
 	respondJSON(w, http.StatusOK, status)
 }
 
 // webhookHandler handles webhooks from payment gateways
 func (r *Router) webhookHandler(w http.ResponseWriter, req *http.Request) {
 	gatewayCode := chi.URLParam(req, "gateway_code")
-	
+
 	// Resolve gateway
 	gateway, ok := r.registry.Resolve(gatewayCode)
 	if !ok {
 		respondError(w, http.StatusNotFound, "gateway not found")
 		return
 	}
-	
+
 	// Read body
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
@@ -210,7 +310,7 @@ func (r *Router) webhookHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	defer req.Body.Close()
-	
+
 	// Verify webhook
 	event, err := gateway.VerifyWebhook(req.Context(), req.Header, body)
 	if err != nil {
@@ -243,7 +343,7 @@ func (r *Router) webhookHandler(w http.ResponseWriter, req *http.Request) {
 
 	// Respond with success
 	respondJSON(w, http.StatusOK, map[string]string{
-		"status": "received",
+		keyStatus: "received",
 	})
 }
 
@@ -286,7 +386,7 @@ func (r *Router) adminRefund(w http.ResponseWriter, req *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, map[string]string{
-		"status": "refunded",
+		keyStatus: "refunded",
 	})
 }
 
@@ -307,7 +407,7 @@ func (r *Router) adminCancel(w http.ResponseWriter, req *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, map[string]string{
-		"status": "cancelled",
+		keyStatus: "cancelled",
 	})
 }
 
@@ -400,8 +500,8 @@ func (r *Router) adminGetReceipt(w http.ResponseWriter, req *http.Request) {
 // adminListGateways lists all configured gateways
 func (r *Router) adminListGateways(w http.ResponseWriter, req *http.Request) {
 	gateways := r.registry.List()
-	
-	var result []map[string]interface{}
+
+	result := make([]map[string]interface{}, 0, len(gateways))
 	for _, g := range gateways {
 		caps := g.Capabilities()
 		result = append(result, map[string]interface{}{
@@ -411,7 +511,7 @@ func (r *Router) adminListGateways(w http.ResponseWriter, req *http.Request) {
 			"currencies":   g.SupportedCurrencies(),
 		})
 	}
-	
+
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"gateways": result,
 	})
@@ -420,13 +520,13 @@ func (r *Router) adminListGateways(w http.ResponseWriter, req *http.Request) {
 // adminGetGatewaySchema returns the configuration schema for a gateway
 func (r *Router) adminGetGatewaySchema(w http.ResponseWriter, req *http.Request) {
 	gatewayCode := chi.URLParam(req, "gateway_code")
-	
+
 	schema, ok := r.registry.GetConfigSchema(gatewayCode)
 	if !ok {
 		respondError(w, http.StatusNotFound, "gateway not found")
 		return
 	}
-	
+
 	respondJSON(w, http.StatusOK, schema)
 }
 
@@ -439,7 +539,7 @@ func (r *Router) mockListTransactions(w http.ResponseWriter, req *http.Request) 
 		respondError(w, http.StatusNotFound, "mock gateway not available")
 		return
 	}
-	
+
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"transactions": adapter.ListTransactions(),
 	})
@@ -452,20 +552,20 @@ func (r *Router) mockCompleteTransaction(w http.ResponseWriter, req *http.Reques
 		respondError(w, http.StatusNotFound, "mock gateway not available")
 		return
 	}
-	
+
 	externalRef := chi.URLParam(req, "external_ref")
-	
+
 	if err := adapter.CompleteTransaction(externalRef); err != nil {
 		respondError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	
+
 	// Deliver webhook so the payment service processes the state change
 	_ = r.deliverMockWebhook(req.Context(), adapter, externalRef, "completed", "payment.completed")
-	
+
 	respondJSON(w, http.StatusOK, map[string]string{
-		"status":  "completed",
-		"message": "transaction marked as completed",
+		keyStatus:  "completed",
+		keyMessage: "transaction marked as completed",
 	})
 }
 
@@ -476,20 +576,20 @@ func (r *Router) mockFailTransaction(w http.ResponseWriter, req *http.Request) {
 		respondError(w, http.StatusNotFound, "mock gateway not available")
 		return
 	}
-	
+
 	externalRef := chi.URLParam(req, "external_ref")
-	
+
 	if err := adapter.FailTransaction(externalRef); err != nil {
 		respondError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	
+
 	// Deliver webhook so the payment service processes the state change
 	_ = r.deliverMockWebhook(req.Context(), adapter, externalRef, "failed", "payment.failed")
-	
+
 	respondJSON(w, http.StatusOK, map[string]string{
-		"status":  "failed",
-		"message": "transaction marked as failed",
+		keyStatus:  "failed",
+		keyMessage: "transaction marked as failed",
 	})
 }
 
@@ -500,20 +600,20 @@ func (r *Router) mockRefundTransaction(w http.ResponseWriter, req *http.Request)
 		respondError(w, http.StatusNotFound, "mock gateway not available")
 		return
 	}
-	
+
 	externalRef := chi.URLParam(req, "external_ref")
-	
+
 	if err := adapter.RefundTransaction(externalRef); err != nil {
 		respondError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	
+
 	// Deliver webhook so the payment service processes the state change
 	_ = r.deliverMockWebhook(req.Context(), adapter, externalRef, "refunded", "payment.refunded")
-	
+
 	respondJSON(w, http.StatusOK, map[string]string{
-		"status":  "refunded",
-		"message": "transaction marked as refunded",
+		keyStatus:  "refunded",
+		keyMessage: "transaction marked as refunded",
 	})
 }
 
@@ -524,14 +624,14 @@ func (r *Router) mockTriggerWebhook(w http.ResponseWriter, req *http.Request) {
 		respondError(w, http.StatusNotFound, "mock gateway not available")
 		return
 	}
-	
+
 	externalRef := chi.URLParam(req, "external_ref")
-	
+
 	slog.Info("mock webhook triggered", slog.String("external_ref", externalRef))
-	
+
 	respondJSON(w, http.StatusOK, map[string]string{
-		"status":  "triggered",
-		"message": "webhook triggered",
+		keyStatus:  "triggered",
+		keyMessage: "webhook triggered",
 	})
 }
 
@@ -542,14 +642,16 @@ func (r *Router) mockCheckoutPage(w http.ResponseWriter, req *http.Request) {
 		respondError(w, http.StatusNotFound, "mock gateway not available")
 		return
 	}
-	
+
 	externalRef := chi.URLParam(req, "external_ref")
-	
+
 	// Set HTML content type
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	
-	html := `<!DOCTYPE html>
+
+	// externalRef is a URL parameter: escape before embedding in HTML/JS.
+	ref := html.EscapeString(externalRef)
+	page := `<!DOCTYPE html>
 <html>
 <head>
     <title>Mock Payment Checkout</title>
@@ -565,7 +667,7 @@ func (r *Router) mockCheckoutPage(w http.ResponseWriter, req *http.Request) {
 <body>
     <h1>Mock Payment Checkout</h1>
     <div class="transaction">
-        <p><strong>Reference:</strong> ` + externalRef + `</p>
+        <p><strong>Reference:</strong> ` + ref + `</p>
         <p><strong>Status:</strong> Pending</p>
         <p class="info">This is a mock checkout page for testing purposes.</p>
     </div>
@@ -575,20 +677,20 @@ func (r *Router) mockCheckoutPage(w http.ResponseWriter, req *http.Request) {
     </div>
     <script>
         function completePayment() {
-            fetch('/api/mock/transactions/` + externalRef + `/complete', { method: 'POST' })
+            fetch('/api/mock/transactions/` + ref + `/complete', { method: 'POST' })
                 .then(() => alert('Payment approved!'))
                 .catch(err => alert('Error: ' + err));
         }
         function failPayment() {
-            fetch('/api/mock/transactions/` + externalRef + `/fail', { method: 'POST' })
+            fetch('/api/mock/transactions/` + ref + `/fail', { method: 'POST' })
                 .then(() => alert('Payment declined!'))
                 .catch(err => alert('Error: ' + err));
         }
     </script>
 </body>
 </html>`
-	
-	w.Write([]byte(html))
+
+	_, _ = w.Write([]byte(page))
 }
 
 // deliverMockWebhook constructs and delivers a mock webhook event to the payment service.
