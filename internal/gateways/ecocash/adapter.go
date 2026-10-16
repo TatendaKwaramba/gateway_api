@@ -75,8 +75,13 @@ func (a *Adapter) SupportedMethods() []gateways.Method {
 }
 
 // SupportedCurrencies returns supported currencies.
+//
+// USD and ZiG only. ZWL (legacy Zimbabwe dollar) is dropped — EcoCash wallets
+// operate in USD and ZiG (ZWG). The string "ZiG" deliberately matches
+// services_supportedcurrency.code so gateway-currency links resolve without
+// aliasing (ISO ZWG naming documented in docs/payments/payment-gateway-modular-plan.md).
 func (a *Adapter) SupportedCurrencies() []string {
-	return []string{"USD", "ZWL"}
+	return []string{"USD", "ZiG"}
 }
 
 // ConfigSchema returns the JSON schema for gateway configuration.

@@ -174,7 +174,9 @@ func TestAdapter_SupportedCurrencies(t *testing.T) {
 	adapter := NewAdapterWithClient(nil, "", "")
 	currencies := adapter.SupportedCurrencies()
 	assert.Contains(t, currencies, "USD")
-	assert.Contains(t, currencies, "ZWL")
+	assert.Contains(t, currencies, "ZiG")
+	assert.NotContains(t, currencies, "ZWL")
+	assert.NotContains(t, currencies, "ZAR")
 }
 
 func TestAdapter_Initiate_Success(t *testing.T) {

@@ -21,6 +21,13 @@ import (
 	"github.com/google/uuid"
 )
 
+// EventTypePaymentCompleted is the canonical event type emitted by every
+// adapter when a payment captures successfully.
+const EventTypePaymentCompleted = "payment.completed"
+
+// EventTypePaymentStatusUpdate is an async status clarification event.
+const EventTypePaymentStatusUpdate = "payment.status_update"
+
 // FulfillmentService is the interface the payment service needs from fulfillment
 type FulfillmentService interface {
 	Fulfill(ctx context.Context, req fulfillment.FulfillRequest) (*fulfillment.FulfillResult, error)
@@ -865,21 +872,56 @@ func NormalizePhoneDigits(phone string) string {
 
 // ProcessWebhook processes a verified webhook event and transitions transaction state.
 func (s *Service) ProcessWebhook(ctx context.Context, gatewayCode string, event gateways.WebhookEvent, rawBody []byte, headers http.Header) error {
-	// Look up transaction by external reference and gateway
 	var transactionID int64
 	var currentState string
+	var txnAmount int64
+	var txnCurrency string
+	// Look up transaction by external reference and gateway. The amount and
+	// currency are read with the state so completed events can be verified
+	// against what the payer was actually charged (amount/currency-match
+	// guard below) before any state transition.
+	// amount is a DECIMAL column ("5.00") — scan raw and convert to minor
+	// units the same way triggerFulfillment does (float -> cents).
+	amountRaw := []byte("0")
 	err := s.db.QueryRowContext(ctx, `
-		SELECT t.id, t.state 
+		SELECT t.id, t.state, t.amount, t.currency
 		FROM payments_paymenttransaction t
 		JOIN payments_paymentgateway g ON g.id = t.gateway_id
 		WHERE t.external_reference = ? AND g.gateway_code = ?
-	`, event.ExternalReference, gatewayCode).Scan(&transactionID, &currentState)
+	`, event.ExternalReference, gatewayCode).Scan(&transactionID, &currentState, &amountRaw, &txnCurrency)
 
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("transaction not found for external_reference=%s gateway=%s", event.ExternalReference, gatewayCode)
 		}
 		return fmt.Errorf("failed to query transaction: %w", err)
+	}
+
+	// Amount/currency match guard: a completed event whose captured amount
+	// or currency differs from the initiated transaction must never advance
+	// the state machine. completionHeld keeps the normal below flow — replay
+	// bookkeeping + webhook audit log still run — but the transition is
+	// skipped so the payment stays in its current state for reconciliation.
+	completionHeld := false
+	if event.EventType == EventTypePaymentCompleted {
+		// Convert the DECIMAL amount to minor units (matches
+		// triggerFulfillment's float->cents conversion).
+		amountFloat := 0.0
+		fmt.Sscanf(string(amountRaw), "%f", &amountFloat)
+		txnAmount = int64(amountFloat * 100)
+		if event.Amount.Amount != txnAmount || !strings.EqualFold(event.Amount.Currency, txnCurrency) {
+			completionHeld = true
+			slog.Warn("webhook amount/currency mismatch — completion held",
+				slog.String("gateway", gatewayCode),
+				slog.String("external_ref", event.ExternalReference),
+				slog.Int64("transaction_id", transactionID),
+				slog.Int64("txn_amount", txnAmount),
+				slog.String("txn_currency", txnCurrency),
+				slog.Int64("event_amount", event.Amount.Amount),
+				slog.String("event_currency", event.Amount.Currency),
+			)
+			metrics.RecordPaymentCompletedMismatch()
+		}
 	}
 
 	// Replay guard: check if this exact webhook has been processed before
@@ -913,6 +955,11 @@ func (s *Service) ProcessWebhook(ctx context.Context, gatewayCode string, event 
 	// Log webhook to audit table
 	if logErr := s.logWebhook(ctx, gatewayCode, event, rawBody, headers, transactionID, true); logErr != nil {
 		slog.Error("failed to log webhook", slog.Any("error", logErr))
+	}
+
+	// Held: return 200 so the gateway does not retry, but do not transition.
+	if completionHeld {
+		return nil
 	}
 
 	// Attempt state transition
@@ -1181,6 +1228,7 @@ type Plan struct {
 }
 
 func (s *Service) validateGatewayCurrency(ctx context.Context, gatewayCode, currency string) error {
+	// Layer 1: DB links (operational policy — what the platform sells).
 	var count int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*)
@@ -1194,6 +1242,27 @@ func (s *Service) validateGatewayCurrency(ctx context.Context, gatewayCode, curr
 	}
 	if count == 0 {
 		return fmt.Errorf("currency %s not supported for gateway %s", currency, gatewayCode)
+	}
+
+	// Layer 2: adapter capability floor (DB links can drift from the
+	// registered adapter — vendor rails win, a stale link must never
+	// reach a real charge endpoint).
+	if s.registry != nil {
+		if adapter, ok := s.registry.Resolve(gatewayCode); ok {
+			declared := false
+			for _, c := range adapter.SupportedCurrencies() {
+				if strings.EqualFold(c, currency) {
+					declared = true
+					break
+				}
+			}
+			if !declared {
+				return fmt.Errorf(
+					"currency %s not supported for gateway %s (db link exists but adapter does not declare it — run seed_gateway_currencies)", currency, gatewayCode)
+			}
+		}
+		// Gateway not registered in this process (env off): DB layer alone
+		// governs; initiate later errors on registry.Resolve anyway.
 	}
 	return nil
 }
@@ -1499,10 +1568,14 @@ type PaymentMethod struct {
 	Method      MethodDetails `json:"method"`
 }
 
-// ListPaymentMethods returns active payment methods from the database, optionally filtered by gateway
-func (s *Service) ListPaymentMethods(ctx context.Context, gatewayCode string) ([]*PaymentMethod, error) {
+// ListPaymentMethods returns active payment methods from the database,
+// optionally filtered by gateway. When curr is non-empty, only methods on
+// gateways whose DB currency links contain it are returned, keeping the
+// checkout method list currency-coherent (adapter capability is additionally
+// floored by the initiate guard).
+func (s *Service) ListPaymentMethods(ctx context.Context, gatewayCode, curr string) ([]*PaymentMethod, error) {
 	query := `
-		SELECT 
+		SELECT
 			pg.gateway_code,
 			pm.method_code,
 			pm.display_name,
@@ -1512,13 +1585,21 @@ func (s *Service) ListPaymentMethods(ctx context.Context, gatewayCode string) ([
 		JOIN payments_paymentgateway pg ON pm.gateway_id = pg.id
 		WHERE pm.is_active = 1 AND pg.is_active = 1
 	`
-
 	var args []interface{}
 	if gatewayCode != "" {
 		query += " AND pg.gateway_code = ?"
 		args = append(args, gatewayCode)
 	}
-
+	if curr != "" {
+		query += `
+			AND EXISTS (
+				SELECT 1 FROM payments_gatewaysupportedcurrency gsc
+				JOIN services_supportedcurrency sc ON sc.id = gsc.currency_id
+				WHERE gsc.gateway_id = pg.id AND gsc.is_active = 1
+				  AND sc.is_active = 1 AND sc.code = ?
+			)`
+		args = append(args, curr)
+	}
 	query += " ORDER BY pm.display_order ASC"
 
 	rows, err := s.db.QueryContext(ctx, query, args...)

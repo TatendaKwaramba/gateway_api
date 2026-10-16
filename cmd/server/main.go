@@ -197,6 +197,12 @@ func run() error {
 	// Create payment service with fulfillment integration
 	paymentService := payments.NewService(db, registry, fulfillmentService, djangoClient, cfg.DefaultCurrency)
 
+	// Surface gateway-vs-DB currency divergence at boot (warn-only; the
+	// initiate guard and currency filters make stale rows inert regardless).
+	if err := payments.CheckGatewayCurrencyDrift(context.Background(), db, registry); err != nil {
+		slog.Warn("currency drift check failed", slog.Any("error", err))
+	}
+
 	// Create admin auth middleware
 	adminAuth := httpapi.AdminHMACMiddleware(cfg.AdminHMACSecret)
 

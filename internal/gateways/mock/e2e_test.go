@@ -39,6 +39,10 @@ type e2eHarness struct {
 func newE2E(t *testing.T) *e2eHarness {
 	t.Helper()
 
+	if testing.Short() {
+		t.Skip("dockertest required")
+	}
+
 	db, cleanupDB, err := testutil.SetupTestDB()
 	require.NoError(t, err, "failed to spin up test database")
 

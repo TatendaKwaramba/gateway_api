@@ -156,6 +156,7 @@ func (r *Router) Setup() chi.Router {
 		admin.Post("/payments/{transaction_id}/cancel", r.adminCancel)
 		admin.Get("/gateways", r.adminListGateways)
 		admin.Get("/gateways/{gateway_code}/schema", r.adminGetGatewaySchema)
+		admin.Get("/gateways/{gateway_code}/currencies", r.adminGetGatewayCurrencies)
 		admin.Post("/notifications/push", r.adminPushNotificationHandler)
 		admin.Post("/identity/revoke", r.identityRevokeHandler)
 	})

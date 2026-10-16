@@ -30,6 +30,16 @@ var (
 		},
 	)
 
+	// paymentCompletionMismatchesTotal counts completed webhooks whose
+	// captured amount/currency did not match the initiated transaction —
+	// completions held for operator reconciliation, payment NOT completed.
+	paymentCompletionMismatchesTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "payments_completion_mismatch_total",
+			Help: "Total number of completed webhooks held: amount/currency mismatch vs transaction",
+		},
+	)
+
 	// paymentsFailedTotal counts failed payments by reason
 	paymentsFailedTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -138,6 +148,11 @@ func RecordPaymentInitiated(gateway, method string) {
 // RecordPaymentCompleted increments the completed counter
 func RecordPaymentCompleted() {
 	paymentsCompletedTotal.Inc()
+}
+
+// RecordPaymentCompletedMismatch increments the completion-mismatch counter
+func RecordPaymentCompletedMismatch() {
+	paymentCompletionMismatchesTotal.Inc()
 }
 
 // RecordPaymentFailed increments the failed counter

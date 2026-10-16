@@ -69,8 +69,9 @@ func (r *Router) listGateways(w http.ResponseWriter, req *http.Request) {
 // listPaymentMethods returns available payment methods from the database, filtered by gateway
 func (r *Router) listPaymentMethods(w http.ResponseWriter, req *http.Request) {
 	gatewayCode := req.URL.Query().Get("gateway")
+	currency := req.URL.Query().Get("currency")
 
-	methods, err := r.paymentService.ListPaymentMethods(req.Context(), gatewayCode)
+	methods, err := r.paymentService.ListPaymentMethods(req.Context(), gatewayCode, currency)
 	if err != nil {
 		slog.Error("failed to list payment methods", slog.Any("error", err))
 		// Return empty array on error - client should handle gracefully
@@ -528,6 +529,27 @@ func (r *Router) adminGetGatewaySchema(w http.ResponseWriter, req *http.Request)
 	}
 
 	respondJSON(w, http.StatusOK, schema)
+}
+
+// adminGetGatewayCurrencies returns the currencies the registered adapter
+// declares it can charge (the capability floor). Beta App gateway/forms use
+// this for write-time validation of currency choices — a currency that is
+// not declared here will be rejected by the initiate guard even if a DB
+// link is created for it.
+func (r *Router) adminGetGatewayCurrencies(w http.ResponseWriter, req *http.Request) {
+	gatewayCode := chi.URLParam(req, "gateway_code")
+
+	adapter, ok := r.registry.Resolve(gatewayCode)
+	if !ok {
+		respondError(w, http.StatusNotFound, "gateway not found")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"gateway_code":      gatewayCode,
+		"currencies":        adapter.SupportedCurrencies(),
+		"supported_methods": adapter.SupportedMethods(),
+	})
 }
 
 // Mock gateway admin handlers

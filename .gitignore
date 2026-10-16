@@ -1,1 +1,4 @@
-server
+/server
+# Local Go build/test caches (gocache container mounts)
+.cache/
+.config/
