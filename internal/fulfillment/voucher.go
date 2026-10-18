@@ -169,7 +169,7 @@ func (s *Service) fulfillVoucher(ctx context.Context, req FulfillRequest) (*Fulf
 	}
 
 	radreplyAttrs := []struct{ attr, value string }{
-		{"Reply-Message", "Cached by Amani Ecosystems"},
+		{"Reply-Message", "Cached by AmaniConnect"},
 		{"Mikrotik-Rate-Limit", rateLimit},
 		{"Mikrotik-Recv-Limit", "1000000000000"},
 		{"Mikrotik-Xmit-Limit", "1000000000000"},

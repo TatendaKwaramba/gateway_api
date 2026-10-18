@@ -47,7 +47,7 @@ func (p *Provider) Send(ctx context.Context, msg notify.Message) error {
 		return errors.New("smtp: recipient is required")
 	}
 	if msg.Subject == "" {
-		msg.Subject = "Amani Ecosystems notification"
+		msg.Subject = "AmaniConnect notification"
 	}
 
 	// Multipart message: always a text part (renderable everywhere) plus a
@@ -99,7 +99,7 @@ func buildMime(from, to, subject, textBody, htmlBody string) []byte {
 	to = strings.TrimSpace(to)
 	subject = strings.TrimSpace(subject)
 	if subject == "" {
-		subject = "Amani Ecosystems notification"
+		subject = "AmaniConnect notification"
 	}
 
 	var builder strings.Builder
@@ -115,7 +115,7 @@ func buildMime(from, to, subject, textBody, htmlBody string) []byte {
 		return []byte(builder.String())
 	}
 
-	boundary := "AmaniOTP-Boundary-7483"
+	boundary := "AmaniConnectOTP-Boundary-7483"
 	fmt.Fprintf(&builder, "Content-Type: multipart/alternative; boundary=\"%s\"\r\n\r\n", boundary)
 	builder.WriteString("--" + boundary + "\r\n")
 	builder.WriteString("Content-Type: text/plain; charset=\"utf-8\"\r\n\r\n")

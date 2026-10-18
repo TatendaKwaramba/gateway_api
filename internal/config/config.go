@@ -68,7 +68,7 @@ type Config struct {
 	ExpoPushEnabled bool   `envconfig:"EXPO_PUSH_ENABLED" default:"false"`
 
 	// Branding — user-visible strings (SMS/email/push texts)
-	BrandName string `envconfig:"BRAND_NAME" default:"Amani Ecosystems"`
+	BrandName string `envconfig:"BRAND_NAME" default:"AmaniConnect"`
 	// Organization attributed to app sign-up customers (0 = auto: the only
 	// organization when the deployment has exactly one, else unattributed)
 	DefaultOrgID int64 `envconfig:"DEFAULT_ORG_ID" default:"0"`

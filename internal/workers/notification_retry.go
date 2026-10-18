@@ -36,7 +36,7 @@ func NewNotificationRetry(db *sql.DB, notifier notify.Provider) *NotificationRet
 	return &NotificationRetry{
 		db:        db,
 		notifier:  notifier,
-		pushTitle: "Amani Ecosystems",
+		pushTitle: "AmaniConnect",
 		stopChan:  make(chan struct{}),
 	}
 }

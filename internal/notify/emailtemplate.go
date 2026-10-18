@@ -94,12 +94,12 @@ func (e OtpEmail) RenderHTML() string {
 
 func (e OtpEmail) brandName() string {
 	if e.Brand == "" {
-		return "Amani Ecosystems"
+		return "AmaniConnect"
 	}
 	return e.Brand
 }
 
 func parentBrand(name string) string {
-	// Keep the footer tagline anchored on the operator brand.
-	return "Amani Ecosystems"
+	// Keep the footer tagline anchored on the platform operator (Betta Technologies).
+	return "Betta Technologies"
 }

@@ -90,7 +90,7 @@ func NewService(db *sql.DB, sms notify.Provider, email notify.Provider, secret s
 		secret:    secretBytes,
 		tokenTTL:  identityTokenTTL,
 		emailFrom: emailFrom,
-		brandName: "Amani Ecosystems",
+		brandName: "AmaniConnect",
 	}
 	if len(secretBytes) >= 32 {
 		svc.primaryID = keyIDFor(secret)

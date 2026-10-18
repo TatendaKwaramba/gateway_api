@@ -154,7 +154,7 @@ func run() error {
 		emailProvider = mailgun.NewProvider(
 			cfg.MailgunAPIKey,
 			cfg.MailgunDomain,
-			fmt.Sprintf("Amani Connect <postmaster@%s>", cfg.MailgunDomain),
+			fmt.Sprintf("AmaniConnect <postmaster@%s>", cfg.MailgunDomain),
 			cfg.MailgunBaseURL,
 		)
 		slog.Info("email provider configured", slog.String("provider", emailProvider.Name()))
