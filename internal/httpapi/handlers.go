@@ -532,7 +532,7 @@ func (r *Router) adminGetGatewaySchema(w http.ResponseWriter, req *http.Request)
 }
 
 // adminGetGatewayCurrencies returns the currencies the registered adapter
-// declares it can charge (the capability floor). Beta App gateway/forms use
+// declares it can charge (the capability floor). Betta App gateway/forms use
 // this for write-time validation of currency choices — a currency that is
 // not declared here will be rejected by the initiate guard even if a DB
 // link is created for it.

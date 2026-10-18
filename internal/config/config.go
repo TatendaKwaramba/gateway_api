@@ -20,7 +20,7 @@ type Config struct {
 	// Database
 	DBDSN string `envconfig:"DB_DSN" required:"true"`
 
-	// Admin authentication (HMAC shared secret with Beta App)
+	// Admin authentication (HMAC shared secret with Betta App)
 	AdminHMACSecret string `envconfig:"ADMIN_HMAC_SECRET" required:"true"`
 
 	// Default currency for tariff plans (used when plan has no currency stored)

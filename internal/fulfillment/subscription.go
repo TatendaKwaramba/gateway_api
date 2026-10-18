@@ -141,7 +141,7 @@ func (s *Service) fulfillSubscription(ctx context.Context, req FulfillRequest) (
 		return nil, fmt.Errorf("fulfillment: upsert radcheck password: %w", err)
 	}
 
-	// Store password in customer record so Beta App can display it
+	// Store password in customer record so Betta App can display it
 	_, err = tx.ExecContext(ctx, `
 		UPDATE authentication_customer SET customer_password = ? WHERE customer_id = ?
 	`, subPassword, customerUsername)
