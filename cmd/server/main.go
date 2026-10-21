@@ -118,7 +118,8 @@ func run() error {
 			cfg.EcoCashBaseURL,
 			cfg.EcoCashNotifyURL,
 			cfg.EcoCashReturnURL,
-		).WithAPICredential(cfg.EcoCashAPICredential)
+		).WithAPICredential(cfg.EcoCashAPICredential).
+			WithMerchantDetails(cfg.EcoCashMerchantName, cfg.EcoCashMerchantName)
 		if err := registry.Register(ecocashAdapter); err != nil {
 			return fmt.Errorf("register ecocash gateway: %w", err)
 		}

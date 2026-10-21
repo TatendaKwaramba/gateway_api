@@ -72,6 +72,13 @@ func (a *Adapter) WithAPICredential(credential string) *Adapter {
 	return a
 }
 
+// WithMerchantDetails sets the super-merchant/merchant names sent on charge
+// requests (EcoCash rejects blank merchantName). Returns the adapter.
+func (a *Adapter) WithMerchantDetails(superMerchantName, merchantName string) *Adapter {
+	a.client.SetMerchantDetails(superMerchantName, merchantName)
+	return a
+}
+
 // Code returns the gateway code.
 func (a *Adapter) Code() string {
 	return GatewayCode
