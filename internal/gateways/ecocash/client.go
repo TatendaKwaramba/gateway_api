@@ -43,6 +43,7 @@ type Client struct {
 	terminalID        string
 	superMerchantName string
 	merchantName      string
+	location          string
 	httpClient        *http.Client
 	baseURL           string
 	basicAuthToken    string // base64(apiKey + ":" + apiCredential), computed once
@@ -101,6 +102,11 @@ func (c *Client) SetBaseURL(baseURL string) {
 func (c *Client) SetMerchantDetails(superMerchantName, merchantName string) {
 	c.superMerchantName = superMerchantName
 	c.merchantName = merchantName
+}
+
+// SetLocation sets the charge-request location (EcoCash rejects blank).
+func (c *Client) SetLocation(location string) {
+	c.location = location
 }
 
 // ChargingInformation contains the payment amount and currency.
@@ -207,6 +213,9 @@ func (c *Client) Charge(ctx context.Context, req ChargeRequest) (*ChargeResponse
 	}
 	if req.TerminalID == "" {
 		req.TerminalID = c.terminalID
+	}
+	if req.Location == "" {
+		req.Location = c.location
 	}
 	if req.SuperMerchantName == "" {
 		req.SuperMerchantName = c.superMerchantName

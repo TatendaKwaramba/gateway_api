@@ -44,6 +44,7 @@ type Config struct {
 	EcoCashMerchantNumber string `envconfig:"ECOCASH_MERCHANT_NUMBER"`
 	EcoCashTerminalID     string `envconfig:"ECOCASH_TERMINAL_ID"`
 	EcoCashMerchantName   string `envconfig:"ECOCASH_MERCHANT_NAME" default:"AmaniConnect"`
+	EcoCashLocation       string `envconfig:"ECOCASH_LOCATION" default:"Harare"`
 	EcoCashBaseURL        string `envconfig:"ECOCASH_BASE_URL" default:"https://developers.ecocash.co.zw/sandbox"`
 	EcoCashNotifyURL      string `envconfig:"ECOCASH_NOTIFY_URL"`
 	EcoCashReturnURL      string `envconfig:"ECOCASH_RETURN_URL"`

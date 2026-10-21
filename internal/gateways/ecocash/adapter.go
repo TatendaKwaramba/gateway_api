@@ -79,6 +79,15 @@ func (a *Adapter) WithMerchantDetails(superMerchantName, merchantName string) *A
 	return a
 }
 
+// WithLocation sets the charge-request location (EcoCash rejects blank).
+// Returns the adapter.
+func (a *Adapter) WithLocation(location string) *Adapter {
+	if location != "" {
+		a.client.SetLocation(location)
+	}
+	return a
+}
+
 // Code returns the gateway code.
 func (a *Adapter) Code() string {
 	return GatewayCode
