@@ -875,6 +875,66 @@ func NormalizePhoneDigits(phone string) string {
 	return string(b)
 }
 
+// findTxnByWebhookCorrelator locates a transaction for a webhook whose
+// external reference matches no stored transaction. Primary key is the
+// clientCorrelator we sent at initiate and EcoCash echoes back
+// (orginalMerchantReference) — persisted in gateway_response. A phone-based
+// fallback accepts only when exactly one pending transaction exists for that
+// MSISDN, and the amount/currency guard below still protects the transition.
+func (s *Service) findTxnByWebhookCorrelator(ctx context.Context, gatewayCode string, event gateways.WebhookEvent) (int64, bool) {
+	correlator := event.Metadata["clientCorrelator"]
+	if correlator == "" {
+		correlator = event.Metadata["orginalMerchantReference"]
+	}
+	if correlator != "" {
+		var txnID int64
+		err := s.db.QueryRowContext(ctx, `
+			SELECT t.id
+			FROM payments_paymenttransaction t
+			JOIN payments_paymentgateway g ON g.id = t.gateway_id
+			WHERE g.gateway_code = ?
+			  AND JSON_UNQUOTE(JSON_EXTRACT(t.gateway_response, '$.clientCorrelator')) = ?
+			  AND t.state IN ('initiated', 'pending')
+			ORDER BY t.id DESC
+			LIMIT 1
+		`, gatewayCode, correlator).Scan(&txnID)
+		if err == nil {
+			return txnID, true
+		}
+	}
+
+	endUser := event.Metadata["endUserId"]
+	if endUser == "" {
+		return 0, false
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT t.id
+		FROM payments_paymenttransaction t
+		JOIN payments_paymentgateway g ON g.id = t.gateway_id
+		WHERE g.gateway_code = ?
+		  AND t.state IN ('initiated', 'pending')
+		  AND t.customer_phone LIKE CONCAT('%', ?)
+		ORDER BY t.id DESC
+		LIMIT 2
+	`, gatewayCode, endUser)
+	if err != nil {
+		return 0, false
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, false
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 1 {
+		return ids[0], true
+	}
+	return 0, false
+}
+
 // ProcessWebhook processes a verified webhook event and transitions transaction state.
 func (s *Service) ProcessWebhook(ctx context.Context, gatewayCode string, event gateways.WebhookEvent, rawBody []byte, headers http.Header) error {
 	var transactionID int64
@@ -897,9 +957,37 @@ func (s *Service) ProcessWebhook(ctx context.Context, gatewayCode string, event 
 
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("transaction not found for external_reference=%s gateway=%s", event.ExternalReference, gatewayCode)
+			// EcoCash webhooks can reference an id that differs from the
+			// charge-response id (sandbox observed 2026-10-21: charge id
+			// 2032334847, webhook/lookup id 9738 for the same payment), so
+			// the primary external_reference match fails. Fall back to the
+			// clientCorrelator we sent at initiate and EcoCash echoes back
+			// (orginalMerchantReference) — persisted in gateway_response.
+			if txnID, ok := s.findTxnByWebhookCorrelator(ctx, gatewayCode, event); ok {
+				err = s.db.QueryRowContext(ctx, `
+					SELECT t.id, t.state, t.amount, t.currency
+					FROM payments_paymenttransaction t
+					WHERE t.id = ?
+				`, txnID).Scan(&transactionID, &currentState, &amountRaw, &txnCurrency)
+				if err == nil {
+					slog.Info("webhook matched by correlator fallback",
+						slog.String("gateway", gatewayCode),
+						slog.String("webhook_ref", event.ExternalReference),
+						slog.Int64("transaction_id", transactionID),
+					)
+				}
+			}
+			if err != nil {
+				// Still audit the unmatched webhook so the raw payload is
+				// never lost for reconciliation.
+				if logErr := s.logWebhook(ctx, gatewayCode, event, rawBody, headers, 0, true); logErr != nil {
+					slog.Error("failed to log unmatched webhook", slog.Any("error", logErr))
+				}
+				return fmt.Errorf("transaction not found for external_reference=%s gateway=%s", event.ExternalReference, gatewayCode)
+			}
+		} else {
+			return fmt.Errorf("failed to query transaction: %w", err)
 		}
-		return fmt.Errorf("failed to query transaction: %w", err)
 	}
 
 	// Amount/currency match guard: a completed event whose captured amount
@@ -1938,13 +2026,17 @@ func (s *Service) GetWebhookLogs(ctx context.Context, transactionID int64) ([]ma
 // logWebhook writes an audit entry to PaymentWebhookLog.
 func (s *Service) logWebhook(ctx context.Context, gatewayCode string, event gateways.WebhookEvent, rawBody []byte, headers http.Header, transactionID int64, signatureValid bool) error {
 	headersJSON, _ := json.Marshal(headers)
+	var txnRef interface{}
+	if transactionID > 0 {
+		txnRef = transactionID
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO payments_paymentwebhooklog (
 			gateway_code, raw_body, headers, signature_valid, processed,
 			error, received_at, processed_at, transaction_id, external_reference
 		)
 		VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), ?, ?)
-	`, gatewayCode, rawBody, headersJSON, signatureValid, true, "", transactionID, event.ExternalReference)
+	`, gatewayCode, rawBody, headersJSON, signatureValid, true, "", txnRef, event.ExternalReference)
 	return err
 }
 

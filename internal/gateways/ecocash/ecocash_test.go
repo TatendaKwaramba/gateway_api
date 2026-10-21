@@ -87,7 +87,7 @@ func mockEcoCashServer(t *testing.T) (*httptest.Server, *Client) {
 				MerchantCode:               chargeReq.MerchantCode,
 			})
 
-		// Lookup endpoint: /{msisdn}/transactions/amount/{clientCorrelator}
+		// Lookup endpoint: /payment/v1/{msisdn}/transactions/amount/{clientCorrelator}
 		case method == http.MethodGet && strings.Contains(path, "/transactions/amount/"):
 			parts := strings.Split(strings.Trim(path, "/"), "/")
 			require.GreaterOrEqual(t, len(parts), 4, "expected at least 4 path segments")
@@ -103,7 +103,7 @@ func mockEcoCashServer(t *testing.T) (*httptest.Server, *Client) {
 				EcoCashResponseCode:        "PAUSED",
 				ResponseMessage:            "PENDING_VALIDATION",
 				CurrencyCode:               "USD",
-				EndUserId:                  parts[0],
+				EndUserId:                  parts[len(parts)-3],
 				MerchantCode:               "986185",
 				ReferenceCode:              strings.ToUpper(parts[len(parts)-1]),
 			}

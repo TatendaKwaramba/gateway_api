@@ -31,7 +31,7 @@ const (
 	sandboxBaseURL    = "https://developers.ecocash.co.zw/sandbox"
 	productionBaseURL = "https://developers.ecocash.co.zw"
 	chargePath        = "/payment/v1/transactions/amount/"
-	refundPath        = "/transactions/refund/"
+	refundPath        = "/payment/v1/transactions/refund/"
 )
 
 // Client is an HTTP client for the EcoCash API.
@@ -370,7 +370,7 @@ func (c *Client) Charge(ctx context.Context, req ChargeRequest) (*ChargeResponse
 
 // Lookup queries the status of a transaction by MSISDN and client correlator.
 func (c *Client) Lookup(ctx context.Context, msisdn, clientCorrelator string) (*LookupResponse, error) {
-	url := fmt.Sprintf("%s/%s/transactions/amount/%s", c.baseURL, msisdn, clientCorrelator)
+	url := fmt.Sprintf("%s/payment/v1/%s/transactions/amount/%s", c.baseURL, msisdn, clientCorrelator)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build lookup request: %w", err)
@@ -563,13 +563,14 @@ func (c *Client) VerifyWebhook(ctx context.Context, headers http.Header, body []
 		Currency:          webhook.CurrencyCode,
 		EventType:         eventType,
 		Metadata: map[string]string{
-			"clientCorrelator":     webhook.ClientCorrelator,
-			"status":               webhook.TransactionOperationStatus,
-			"statusMessage":        webhook.Message(),
-			"ecocashReference":     webhook.EcoCashReference,
-			"endUserId":            webhook.EndUserId,
-			"merchantCode":         webhook.MerchantCode,
-			"serverReferenceCode":  webhook.ServerReferenceCode,
+			"clientCorrelator":           webhook.ClientCorrelator,
+			"orginalMerchantReference":   webhook.OriginMerchantReference,
+			"status":                     webhook.TransactionOperationStatus,
+			"statusMessage":              webhook.Message(),
+			"ecocashReference":           webhook.EcoCashReference,
+			"endUserId":                  webhook.EndUserId,
+			"merchantCode":               webhook.MerchantCode,
+			"serverReferenceCode":        webhook.ServerReferenceCode,
 		},
 	}, nil
 }
