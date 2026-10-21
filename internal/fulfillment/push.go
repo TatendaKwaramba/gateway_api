@@ -129,8 +129,8 @@ func (s *Service) sendPushForPhone(ctx context.Context, transactionID int64, pho
 func (s *Service) insertNotificationAttempt(ctx context.Context, transactionID int64, recipient, channel, body string) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO notification_attempts (
-			transaction_id, recipient, channel, body, status, retry_count, attempted_at
-		) VALUES (?, ?, ?, ?, 'pending', 0, NOW())
+			transaction_id, recipient, channel, body, status, retry_count, attempted_at, updated_at
+		) VALUES (?, ?, ?, ?, 'pending', 0, NOW(), NOW())
 	`, transactionID, recipient, channel, body)
 	if err != nil {
 		return 0, fmt.Errorf("failed to log notification attempt: %w", err)
@@ -142,7 +142,7 @@ func (s *Service) insertNotificationAttempt(ctx context.Context, transactionID i
 func (s *Service) completeNotificationAttempt(ctx context.Context, attemptID int64, provider, status string, err error) {
 	_, _ = s.db.ExecContext(ctx, `
 		UPDATE notification_attempts
-		SET status = ?, provider = ?, error = ?, completed_at = NOW()
+		SET status = ?, provider = ?, error = ?, completed_at = NOW(), updated_at = NOW()
 		WHERE id = ?
 	`, status, provider, errToString(err), attemptID)
 }
