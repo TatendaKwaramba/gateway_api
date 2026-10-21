@@ -342,11 +342,16 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 	}
 
 	// Merge gateway result into existing metadata (preserving referral_code etc.)
+	// Per-gateway metadata (e.g. ecocash clientCorrelator) is persisted too so
+	// the poller can rehydrate status-lookup state after a restart.
 	mergedResponse := make(map[string]interface{})
 	if len(req.Metadata) > 0 {
 		for k, v := range req.Metadata {
 			mergedResponse[k] = v
 		}
+	}
+	for k, v := range gatewayResult.Metadata {
+		mergedResponse[k] = v
 	}
 	mergedResponse["state"] = gatewayResult.State
 	mergedResponse["external_reference"] = gatewayResult.ExternalReference
@@ -1150,13 +1155,14 @@ func (s *Service) triggerFulfillment(ctx context.Context, transactionID int64) {
 // PollStatus checks the current status of a transaction via the gateway's API.
 func (s *Service) PollStatus(ctx context.Context, transactionID int64) (*GetStatusResponse, error) {
 	// Fetch transaction details
-	var externalRef, gatewayCode, currentState string
+	var externalRef, gatewayCode, currentState, customerPhone, gatewayResponseJSON string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT t.external_reference, g.gateway_code, t.state
+		SELECT t.external_reference, g.gateway_code, t.state,
+		       COALESCE(t.customer_phone, ''), COALESCE(t.gateway_response, '')
 		FROM payments_paymenttransaction t
 		JOIN payments_paymentgateway g ON g.id = t.gateway_id
 		WHERE t.id = ?
-	`, transactionID).Scan(&externalRef, &gatewayCode, &currentState)
+	`, transactionID).Scan(&externalRef, &gatewayCode, &currentState, &customerPhone, &gatewayResponseJSON)
 
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1173,6 +1179,13 @@ func (s *Service) PollStatus(ctx context.Context, transactionID int64) (*GetStat
 	gateway, ok := s.registry.Resolve(gatewayCode)
 	if !ok {
 		return nil, fmt.Errorf("gateway not found: %s", gatewayCode)
+	}
+
+	// Restart recovery: rehydrate gateway-adapter status context from the
+	// persisted row before the lookup (mirrors the poller; see
+	// gateways.StatusCachePreloader).
+	if preloader, ok := gateway.(gateways.StatusCachePreloader); ok {
+		preloader.PreloadStatusData(externalRef, customerPhone, gatewayResponseJSON)
 	}
 
 	// Update last_polled_at

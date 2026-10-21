@@ -269,10 +269,33 @@ func TestAdapter_Status(t *testing.T) {
 
 	adapter := NewAdapterWithClient(client, server.URL+"/webhook", server.URL+"/return")
 
-	// Seed the MSISDN cache
+	// Seed the lookup cache (msisdn + clientCorrelator echoed at initiate)
 	adapter.msisdnCacheMu.Lock()
-	adapter.msisdnCache["PP1204433.1148.78123456"] = "0772123456"
+	adapter.msisdnCache["PP1204433.1148.78123456"] = cacheEntry{
+		msisdn:     "0772123456",
+		correlator: "test-ref-001",
+	}
 	adapter.msisdnCacheMu.Unlock()
+
+	result, err := adapter.Status(context.Background(), "PP1204433.1148.78123456")
+	require.NoError(t, err)
+	assert.Equal(t, "pending", result.State)
+	assert.Equal(t, int64(500), result.Amount.Amount)
+}
+
+func TestAdapter_Status_PreloadedAfterRestart(t *testing.T) {
+	server, client := mockEcoCashServer(t)
+	defer server.Close()
+
+	adapter := NewAdapterWithClient(client, server.URL+"/webhook", server.URL+"/return")
+
+	// Cache cold (fresh process): rehydrate from the persisted transaction
+	// row the way the poller/service do (customer_phone + gateway_response).
+	adapter.PreloadStatusData(
+		"PP1204433.1148.78123456",
+		"0772123456",
+		`{"state":"pending","external_reference":"PP1204433.1148.78123456","clientCorrelator":"test-ref-001"}`,
+	)
 
 	result, err := adapter.Status(context.Background(), "PP1204433.1148.78123456")
 	require.NoError(t, err)
@@ -285,7 +308,7 @@ func TestAdapter_Status_CacheMiss(t *testing.T) {
 
 	_, err := adapter.Status(context.Background(), "UNKNOWN-REF")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "MSISDN not found")
+	assert.Contains(t, err.Error(), "lookup context not found")
 }
 
 func TestAdapter_Refund_Success(t *testing.T) {
@@ -379,7 +402,8 @@ func TestClient_Refund(t *testing.T) {
 }
 
 func TestClient_VerifyWebhook(t *testing.T) {
-	client := NewClient("id", "code", "pin", "number", "terminal", "http://localhost")
+	// Client pinned to the real merchant code; payload echoes the same code.
+	client := NewClient("id", "986185", "pin", "number", "terminal", "http://localhost")
 
 	webhookPayload := map[string]string{
 		"transactionId":    "PP1204433.1148.78123456",
@@ -729,4 +753,54 @@ func TestChargeResponse_AllFieldsParsed(t *testing.T) {
 	assert.Equal(t, "0772123456", resp.EndUserMSISN)
 	assert.Equal(t, "986185", resp.MerchantCode)
 	assert.Equal(t, "2024-04-22T11:41:45.382", resp.Timestamp)
+}
+
+func TestClient_VerifyWebhook_MerchantPinMismatch(t *testing.T) {
+	// Spoofed notification for a different merchant must never complete one
+	// of our transactions (EcoCash webhooks carry no HMAC — the echoed
+	// merchant code is the only in-band authenticity signal).
+	client := NewClient("id", "986185", "pin", "number", "terminal", "http://localhost")
+
+	webhookPayload := map[string]string{
+		"transactionId": "PP1204433.1148.78123456",
+		"status":        "Successful",
+		"merchantCode":  "OTHER-MERCHANT",
+	}
+	body, _ := json.Marshal(webhookPayload)
+
+	_, err := client.VerifyWebhook(context.Background(), http.Header{}, body)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "merchantCode mismatch")
+}
+
+func TestClient_VerifyWebhook_MerchantPinMatch(t *testing.T) {
+	client := NewClient("id", "986185", "pin", "number", "terminal", "http://localhost")
+
+	webhookPayload := map[string]string{
+		"transactionId": "PP1204433.1148.78123456",
+		"status":        "Successful",
+		"merchantCode":  "986185",
+	}
+	body, _ := json.Marshal(webhookPayload)
+
+	event, err := client.VerifyWebhook(context.Background(), http.Header{}, body)
+	require.NoError(t, err)
+	assert.Equal(t, "completed", event.State)
+	assert.Equal(t, "986185", event.Metadata["merchantCode"])
+}
+
+func TestClient_VerifyWebhook_MerchantPinAbsent(t *testing.T) {
+	// Some EcoCash integrations omit merchantCode — accepted (documented in
+	// docs/payments/payment-gateway-modular-plan.md Phase 6).
+	client := NewClient("id", "986185", "pin", "number", "terminal", "http://localhost")
+
+	webhookPayload := map[string]string{
+		"transactionId": "PP1204433.1148.78123456",
+		"status":        "Successful",
+	}
+	body, _ := json.Marshal(webhookPayload)
+
+	event, err := client.VerifyWebhook(context.Background(), http.Header{}, body)
+	require.NoError(t, err)
+	assert.Equal(t, "completed", event.State)
 }

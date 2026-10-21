@@ -359,6 +359,19 @@ func (c *Client) VerifyWebhook(ctx context.Context, headers http.Header, body []
 		return gateways.WebhookEvent{}, fmt.Errorf("missing transactionId in webhook")
 	}
 
+	// Merchant-code pinning: EcoCash webhooks carry no HMAC, so the only
+	// in-band authenticity signal is the echoed merchant code. Accept the
+	// payload when it is absent (some integrations do not send it — logged
+	// by the caller via the webhook audit row) but reject a mismatch so a
+	// spoofed notification for a different merchant can never complete one
+	// of our transactions.
+	if webhook.MerchantCode != "" && webhook.MerchantCode != c.merchantCode {
+		return gateways.WebhookEvent{}, fmt.Errorf(
+			"webhook merchantCode mismatch: got %q, want %q",
+			webhook.MerchantCode, c.merchantCode,
+		)
+	}
+
 	// Parse amount
 	var amountCents int64
 	if webhook.Amount != "" {

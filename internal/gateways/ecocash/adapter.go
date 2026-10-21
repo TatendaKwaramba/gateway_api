@@ -2,6 +2,7 @@ package ecocash
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -24,10 +25,20 @@ type Adapter struct {
 	notifyURL string
 	returnURL string
 
-	// msisdnCache maps external reference → MSISDN for status lookups.
-	// EcoCash lookup requires MSISDN + clientCorrelator; we cache MSISDN from Initiate.
-	msisdnCache   map[string]string
+	// msisdnCache maps external reference (EcoCash transactionId) → lookup
+	// context for status queries. EcoCash lookup requires MSISDN +
+	// clientCorrelator; we capture both from the Initiate response.
+	msisdnCache   map[string]cacheEntry
 	msisdnCacheMu sync.RWMutex
+}
+
+// cacheEntry holds the per-transaction status-lookup context.
+// correlator is empty for legacy entries where only the MSISDN is known;
+// CustomerLookup then falls back to using the external reference as the
+// correlator.
+type cacheEntry struct {
+	msisdn    string
+	correlator string
 }
 
 // NewAdapter creates a new EcoCash gateway adapter.
@@ -37,7 +48,7 @@ func NewAdapter(apiKey, merchantCode, merchantPin, merchantNumber, terminalID, b
 		client:      client,
 		notifyURL:   notifyURL,
 		returnURL:   returnURL,
-		msisdnCache: make(map[string]string),
+		msisdnCache: make(map[string]cacheEntry),
 	}
 }
 
@@ -47,7 +58,7 @@ func NewAdapterWithClient(client *Client, notifyURL, returnURL string) *Adapter 
 		client:      client,
 		notifyURL:   notifyURL,
 		returnURL:   returnURL,
-		msisdnCache: make(map[string]string),
+		msisdnCache: make(map[string]cacheEntry),
 	}
 }
 
@@ -155,9 +166,18 @@ func (a *Adapter) Initiate(ctx context.Context, req gateways.InitiateRequest) (g
 		return gateways.InitiateResult{}, fmt.Errorf("ecocash initiate failed: %w", err)
 	}
 
-	// Cache MSISDN for status lookups
+	// Cache lookup context for status (msisdn + clientCorrelator). Prefer the
+	// echoed correlator from the charge response; fall back to the locally
+	// built one when the response omits it.
+	correlator := chargeResp.ClientCorrelator
+	if correlator == "" {
+		correlator = clientCorrelator
+	}
 	a.msisdnCacheMu.Lock()
-	a.msisdnCache[chargeResp.TransactionID] = chargeResp.EndUserMSISN
+	a.msisdnCache[chargeResp.TransactionID] = cacheEntry{
+		msisdn:     chargeResp.EndUserMSISN,
+		correlator: correlator,
+	}
 	a.msisdnCacheMu.Unlock()
 
 	// Map status
@@ -178,20 +198,23 @@ func (a *Adapter) Initiate(ctx context.Context, req gateways.InitiateRequest) (g
 
 // Status checks the current status of a transaction.
 func (a *Adapter) Status(ctx context.Context, externalRef string) (gateways.StatusResult, error) {
-	// Retrieve MSISDN from cache
+	// Retrieve lookup context from cache
 	a.msisdnCacheMu.RLock()
-	msisdn, ok := a.msisdnCache[externalRef]
+	entry, ok := a.msisdnCache[externalRef]
 	a.msisdnCacheMu.RUnlock()
 
 	if !ok {
-		return gateways.StatusResult{}, fmt.Errorf("MSISDN not found for reference: %s (cache cold — use webhook or poll)", externalRef)
+		return gateways.StatusResult{}, fmt.Errorf("lookup context not found for reference: %s (cache cold — use webhook or poll)", externalRef)
 	}
 
-	// Extract client correlator from external reference
-	// EcoCash transactionId format: "PP1204433.1148.78123456"
-	// The clientCorrelator was used to create the transaction, so we need to look it up
-	// by MSISDN + the external reference works as the correlator in the lookup API
-	lookupResp, err := a.client.Lookup(ctx, msisdn, externalRef)
+	// EcoCash lookup is keyed by MSISDN + clientCorrelator. Fresh entries
+	// carry the correlator echoed at initiate; legacy entries fall back to
+	// using the external reference as the correlator.
+	correlator := entry.correlator
+	if correlator == "" {
+		correlator = externalRef
+	}
+	lookupResp, err := a.client.Lookup(ctx, entry.msisdn, correlator)
 	if err != nil {
 		return gateways.StatusResult{}, fmt.Errorf("ecocash status check failed: %w", err)
 	}
@@ -211,6 +234,53 @@ func (a *Adapter) Status(ctx context.Context, externalRef string) (gateways.Stat
 		Amount:   gateways.Money{Amount: amountCents, Currency: lookupResp.Currency},
 		Currency: lookupResp.Currency,
 	}, nil
+}
+
+// PreloadStatusData implements gateways.StatusCachePreloader. Rehydrates the
+// per-transaction lookup context from the persisted transaction row so a
+// restart-cold adapter can still poll pending EcoCash transactions:
+//   - MSISDN: from the transaction's customer_phone (normalized the same way
+//     as at initiate — normalizeMSISDN is idempotent)
+//   - clientCorrelator: from the gateway_response metadata persisted
+//     at initiate (InitiateResult.Metadata["clientCorrelator"])
+func (a *Adapter) PreloadStatusData(externalRef, customerPhone, initiateResponseJSON string) {
+	if externalRef == "" {
+		return
+	}
+
+	entry := cacheEntry{}
+
+	if customerPhone != "" {
+		entry.msisdn = normalizeMSISDN(customerPhone)
+	}
+
+	if initiateResponseJSON != "" {
+		// gateway_response is a flat map (request metadata merged with
+		// state/external_reference/gateway metadata). The correlator lives
+		// at the top level once the service merges InitiateResult.Metadata;
+		// accept a nested {"metadata": {...}} shape defensively.
+		var persisted map[string]interface{}
+		if err := json.Unmarshal([]byte(initiateResponseJSON), &persisted); err == nil {
+			if v, ok := persisted["clientCorrelator"].(string); ok && v != "" {
+				entry.correlator = v
+			} else if nested, ok := persisted["metadata"].(map[string]interface{}); ok {
+				if v, ok := nested["clientCorrelator"].(string); ok && v != "" {
+					entry.correlator = v
+				}
+			}
+		}
+	}
+
+	if entry.msisdn == "" && entry.correlator == "" {
+		return
+	}
+
+	a.msisdnCacheMu.Lock()
+	// Never clobber a fresher webhook-driven entry: preload only fills gaps.
+	if _, exists := a.msisdnCache[externalRef]; !exists {
+		a.msisdnCache[externalRef] = entry
+	}
+	a.msisdnCacheMu.Unlock()
 }
 
 // VerifyWebhook validates and parses an EcoCash webhook payload.

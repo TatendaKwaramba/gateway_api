@@ -116,6 +116,20 @@ type Gateway interface {
 	Refund(ctx context.Context, externalRef string, amount Money) (RefundResult, error)
 }
 
+// StatusCachePreloader is an optional interface for gateways whose status
+// lookups depend on per-initiate data (correlators, MSISDNs) that only
+// survives in adapter memory. The poller rehydrates that state from the
+// persisted transaction row (gateway_response metadata + customer_phone)
+// into the adapter after a payments-api restart, so pending transactions
+// remain pollable when the cache is cold.
+type StatusCachePreloader interface {
+	// PreloadStatusData rehydrates status-lookup context for one transaction.
+	// externalRef is the gateway external reference stored on the transaction,
+	// customerPhone the customer MSISDN captured at initiate, and
+	// initiateResponseJSON the raw gateway_response JSON persisted at initiate.
+	PreloadStatusData(externalRef, customerPhone, initiateResponseJSON string)
+}
+
 // Registry maintains a map of gateway codes to gateway instances
 type Registry struct {
 	mu       sync.RWMutex

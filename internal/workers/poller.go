@@ -86,7 +86,7 @@ func (p *Poller) run(ctx context.Context) {
 	// Query transactions that are pending and haven't been polled in the last 30s,
 	// or are older than maxPollAge
 	rows, err := p.db.QueryContext(ctx, `
-		SELECT t.id, t.external_reference, g.gateway_code, t.state
+		SELECT t.id, t.external_reference, g.gateway_code, t.state, t.customer_phone, t.gateway_response
 		FROM payments_paymenttransaction t
 		JOIN payments_paymentgateway g ON g.id = t.gateway_id
 		WHERE t.state IN ('initiated', 'pending')
@@ -102,9 +102,9 @@ func (p *Poller) run(ctx context.Context) {
 	var checked int
 	for rows.Next() {
 		var transactionID int64
-		var externalRef sql.NullString
+		var externalRef, customerPhone, gatewayResponse sql.NullString
 		var gatewayCode, currentState string
-		if err := rows.Scan(&transactionID, &externalRef, &gatewayCode, &currentState); err != nil {
+		if err := rows.Scan(&transactionID, &externalRef, &gatewayCode, &currentState, &customerPhone, &gatewayResponse); err != nil {
 			slog.Error("poller: failed to scan row", slog.Any("error", err))
 			continue
 		}
@@ -112,8 +112,16 @@ func (p *Poller) run(ctx context.Context) {
 		if externalRef.Valid {
 			externalRefStr = externalRef.String
 		}
+		customerPhoneStr := ""
+		if customerPhone.Valid {
+			customerPhoneStr = customerPhone.String
+		}
+		gatewayResponseStr := ""
+		if gatewayResponse.Valid {
+			gatewayResponseStr = gatewayResponse.String
+		}
 		checked++
-		p.processTransaction(ctx, transactionID, externalRefStr, gatewayCode, currentState)
+		p.processTransaction(ctx, transactionID, externalRefStr, gatewayCode, currentState, customerPhoneStr, gatewayResponseStr)
 	}
 
 	// Re-drive fulfillment for captured-but-unfulfilled transactions
@@ -181,7 +189,7 @@ func (p *Poller) retryUnfulfilled(ctx context.Context) {
 	}
 }
 
-func (p *Poller) processTransaction(ctx context.Context, transactionID int64, externalRef, gatewayCode, currentState string) {
+func (p *Poller) processTransaction(ctx context.Context, transactionID int64, externalRef, gatewayCode, currentState, customerPhone, gatewayResponseJSON string) {
 	// Update last_polled_at
 	_, _ = p.db.ExecContext(ctx, `
 		UPDATE payments_paymenttransaction SET last_polled_at = NOW() WHERE id = ?
@@ -195,6 +203,13 @@ func (p *Poller) processTransaction(ctx context.Context, transactionID int64, ex
 			slog.String("gateway", gatewayCode),
 		)
 		return
+	}
+
+	// Restart recovery: gateways whose status lookups depend on per-initiate
+	// state held only in adapter memory (ecocash correlator + MSISDN) get it
+	// rehydrated from the persisted transaction row before Status.
+	if preloader, ok := gateway.(gateways.StatusCachePreloader); ok {
+		preloader.PreloadStatusData(externalRef, customerPhone, gatewayResponseJSON)
 	}
 
 	// Query gateway status
