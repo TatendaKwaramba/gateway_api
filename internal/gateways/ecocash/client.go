@@ -153,18 +153,9 @@ type ChargeRequest struct {
 	Remarks                    string        `json:"remarks,omitempty"`
 }
 
-// ChargeResponse contains the response from an EcoCash charge request.
-type ChargeResponse struct {
-	TransactionID    string `json:"transactionId"`
-	ClientCorrelator string `json:"clientCorrelator"`
-	Status           string `json:"status"`
-	StatusMessage    string `json:"statusMessage"`
-	EcoCashRef       string `json:"ecocashRef"`
-	Currency         string `json:"currency"`
-	EndUserMSISN     string `json:"endUserMSISN"`
-	MerchantCode     string `json:"merchantCode"`
-	Timestamp        string `json:"timestamp"`
-}
+// ChargeResponse contains the response from an EcoCash charge request
+// (same wire shape as lookup/refund — see EcoCashTransaction).
+type ChargeResponse = EcoCashTransaction
 
 // RefundRequest contains the parameters for a refund/reversal.
 type RefundRequest struct {
@@ -177,23 +168,116 @@ type RefundRequest struct {
 }
 
 // RefundResponse contains the response from a refund request.
-type RefundResponse struct {
-	Status        string `json:"status"`
-	StatusMessage string `json:"statusMessage"`
-	TransactionID string `json:"transactionId"`
-}
+type RefundResponse = EcoCashTransaction
 
 // LookupResponse contains the result of a transaction status lookup.
-type LookupResponse struct {
-	TransactionID    string `json:"transactionId"`
-	ClientCorrelator string `json:"clientCorrelator"`
-	Status           string `json:"status"`
-	StatusMessage    string `json:"statusMessage"`
-	Currency         string `json:"currency"`
-	EndUserMSISN     string `json:"endUserMSISN"`
-	MerchantCode     string `json:"merchantCode"`
-	Amount           string `json:"amount"`
-	Timestamp        string `json:"timestamp"`
+type LookupResponse = EcoCashTransaction
+
+// EcoCashTransaction is the wire payload shared by the Charge, Lookup and
+// Refund endpoints (field-verified against the sandbox 2026-10-21 with
+// correlators amaniconnect-probe-004/005). It differs substantially from
+// the older developer-portal examples: the transaction identifier is the
+// numeric "id" and status lives in transactionOperationStatus /
+// ecocashResponseCode / responseMessage.
+type EcoCashTransaction struct {
+	ID                         json.Number `json:"id"`
+	Version                    int64       `json:"version"`
+	ServerReferenceCode        string      `json:"serverReferenceCode"`
+	ClientCorrelator           string      `json:"clientCorrelator"`
+	ReferenceCode              string      `json:"referenceCode"`
+	OriginMerchantReference    string      `json:"orginalMerchantReference"` // sic — EcoCash spells it without the "i"
+	EndUserId                  string      `json:"endUserId"`
+	TranType                   string      `json:"tranType"`
+	TransactionOperationStatus string      `json:"transactionOperationStatus"`
+	EcoCashReference           string      `json:"ecocashReference"`
+	EcoCashResponseCode        string      `json:"ecocashResponseCode"`
+	ResponseCode               string      `json:"responseCode"`
+	ResponseMessage            string      `json:"responseMessage"`
+	Text                       string      `json:"text"`
+	CurrencyCode               string      `json:"currencyCode"`
+	MerchantCode               string      `json:"merchantCode"`
+	MerchantNumber             string      `json:"merchantNumber"`
+	MerchantName               string      `json:"merchantName"`
+	SuperMerchantName          string      `json:"superMerchantName"`
+	Remarks                    string      `json:"remarks"`
+	TransactionDate            int64       `json:"transactionDate"`
+	NotifyURL                  string      `json:"notifyUrl"`
+	PaymentAmount              struct {
+		TotalAmountCharged float64 `json:"totalAmountCharged"`
+	} `json:"paymentAmount"`
+
+	// TransactionLegacyID catches notifications sent in the older summary
+	// shape ({"transactionId": "..."}) that carry no id/serverReferenceCode.
+	TransactionLegacyID string `json:"-"`
+}
+
+// TxID returns the transaction identifier for gateway bookkeeping. The
+// numeric id is primary; serverReferenceCode is the fallback for payloads
+// that omit it.
+func (t *EcoCashTransaction) TxID() string {
+	if t.ID.String() != "" && t.ID.String() != "0" {
+		return t.ID.String()
+	}
+	if t.ServerReferenceCode != "" {
+		return t.ServerReferenceCode
+	}
+	return t.TransactionLegacyID
+}
+
+// Message returns the best human-readable status text.
+func (t *EcoCashTransaction) Message() string {
+	if t.Text != "" {
+		return t.Text
+	}
+	if t.ResponseMessage != "" {
+		return t.ResponseMessage
+	}
+	return t.TransactionOperationStatus
+}
+
+// mapEcoCashTxnState maps a wire transaction payload to our state machine.
+// Field-verified states (sandbox):
+//   - pending: transactionOperationStatus "PENDING SUBSCRIBER VALIDATION",
+//     ecocashResponseCode "PAUSED", responseMessage "PENDING_VALIDATION"
+//   - completed: op "COMPLETED", code "SUCCEEDED", ecocashReference set,
+//     responseMessage "process service request successfully."
+// Failure simulations (insufficient funds, invalid PIN, limit) are mapped
+// from the responseMessage / responseCode heuristics below; anything
+// unrecognized stays pending so polling/webhook can resolve it later.
+func mapEcoCashTxnState(txn EcoCashTransaction) string {
+	op := strings.ToLower(strings.TrimSpace(txn.TransactionOperationStatus))
+	code := strings.ToLower(strings.TrimSpace(txn.EcoCashResponseCode))
+	respCode := strings.ToLower(strings.TrimSpace(txn.ResponseCode))
+	msg := strings.ToLower(txn.ResponseMessage + " " + txn.Text + " " + txn.TransactionOperationStatus)
+
+	switch {
+	case strings.Contains(op, "pending") || code == "paused" || respCode == "pending":
+		return statePending
+	case code == "failed" || respCode == "failed":
+		return "failed"
+	case strings.Contains(msg, "insufficient") ||
+		strings.Contains(msg, "invalid pin") ||
+		strings.Contains(msg, "limit") ||
+		strings.Contains(msg, "failed"):
+		return "failed"
+	case code == "succeeded" || op == "completed" ||
+		op == "successful" || op == "delivered" || op == "success":
+		if txn.EcoCashReference != "" {
+			return "completed"
+		}
+		// Completed without succeeded code and without a wallet reference —
+		// treat as failed unless the message affirmatively says success.
+		if strings.Contains(msg, "successfully") || strings.Contains(msg, "successful") {
+			return "completed"
+		}
+		return "failed"
+	case code == "cancelled" || respCode == "cancelled" || op == "cancelled":
+		return "cancelled"
+	case code == "reversed" || respCode == "reversed" || op == "reversed":
+		return "refunded"
+	default:
+		return statePending
+	}
 }
 
 // Charge sends a C2B charge request to EcoCash, initiating a USSD PIN push to the customer.
@@ -279,6 +363,7 @@ func (c *Client) Charge(ctx context.Context, req ChargeRequest) (*ChargeResponse
 	if err := json.Unmarshal(respBody, &chargeResp); err != nil {
 		return nil, fmt.Errorf("failed to parse charge response: %w", err)
 	}
+	legacyTxnFill(&chargeResp, respBody)
 
 	return &chargeResp, nil
 }
@@ -319,6 +404,7 @@ func (c *Client) Lookup(ctx context.Context, msisdn, clientCorrelator string) (*
 	if err := json.Unmarshal(respBody, &lookupResp); err != nil {
 		return nil, fmt.Errorf("failed to parse lookup response: %w", err)
 	}
+	legacyTxnFill(&lookupResp, respBody)
 
 	return &lookupResp, nil
 }
@@ -369,30 +455,74 @@ func (c *Client) Refund(ctx context.Context, req RefundRequest) (*RefundResponse
 	if err := json.Unmarshal(respBody, &refundResp); err != nil {
 		return nil, fmt.Errorf("failed to parse refund response: %w", err)
 	}
+	legacyTxnFill(&refundResp, respBody)
 
 	return &refundResp, nil
 }
 
-// VerifyWebhook validates and parses an EcoCash webhook notification.
-func (c *Client) VerifyWebhook(ctx context.Context, headers http.Header, body []byte) (gateways.WebhookEvent, error) {
-	// Parse the webhook JSON body
-	var webhook struct {
-		TransactionID    string `json:"transactionId"`
-		ClientCorrelator string `json:"clientCorrelator"`
-		Status           string `json:"status"`
-		StatusMessage    string `json:"statusMessage"`
-		Currency         string `json:"currency"`
-		EndUserMSISN     string `json:"endUserMSISN"`
-		MerchantCode     string `json:"merchantCode"`
-		Amount           string `json:"amount"`
-		Timestamp        string `json:"timestamp"`
+// legacyTxnFill backfills a transaction struct from the older summary wire
+// shape ({"transactionId", "status", "statusMessage", ...}) when the real
+// fields are missing. Used by all response parsers and the webhook handler
+// so a legacy variant can never read as an empty identifier/status.
+func legacyTxnFill(txn *EcoCashTransaction, body []byte) {
+	if txn.TxID() != "" && txn.TransactionOperationStatus != "" &&
+		txn.CurrencyCode != "" && txn.PaymentAmount.TotalAmountCharged != 0 {
+		return
 	}
+	var legacy struct {
+		TransactionID string `json:"transactionId"`
+		Status        string `json:"status"`
+		StatusMessage string `json:"statusMessage"`
+		Currency      string `json:"currency"`
+		Amount        string `json:"amount"`
+		EndUserMSISN  string `json:"endUserMSISN"`
+	}
+	if err := json.Unmarshal(body, &legacy); err != nil || (legacy.TransactionID == "" &&
+		legacy.Status == "" && legacy.StatusMessage == "" && legacy.Amount == "") {
+		return
+	}
+	if legacy.TransactionID != "" && txn.TxID() == "" {
+		txn.TransactionLegacyID = legacy.TransactionID
+	}
+	if legacy.Status != "" && txn.TransactionOperationStatus == "" {
+		txn.TransactionOperationStatus = legacy.Status
+	}
+	if legacy.StatusMessage != "" && txn.ResponseMessage == "" {
+		txn.ResponseMessage = legacy.StatusMessage
+	}
+	if legacy.Currency != "" && txn.CurrencyCode == "" {
+		txn.CurrencyCode = legacy.Currency
+	}
+	if legacy.EndUserMSISN != "" && txn.EndUserId == "" {
+		txn.EndUserId = legacy.EndUserMSISN
+	}
+	if legacy.Amount != "" && txn.PaymentAmount.TotalAmountCharged == 0 {
+		var amt float64
+		if _, err := fmt.Sscanf(legacy.Amount, "%f", &amt); err == nil {
+			txn.PaymentAmount.TotalAmountCharged = amt
+		}
+	}
+}
 
+// VerifyWebhook validates and parses an EcoCash webhook notification.
+//
+// The notification payload is not HMAC-signed (no signature scheme in the
+// current spec). We parse the transaction wire shape (EcoCashTransaction,
+// the same as the lookup endpoint) plus a legacy summary variant. The
+// only in-band authenticity signal is the echoed merchant code (pinned
+// below); TLS termination in front of the webhook endpoint is the
+// additional transport hardening.
+func (c *Client) VerifyWebhook(ctx context.Context, headers http.Header, body []byte) (gateways.WebhookEvent, error) {
+	// The notification body mirrors the transaction wire shape; only the
+	// identifier key differs between variants (id vs transactionId). The
+	// legacy summary shape is backfilled by legacyTxnFill.
+	var webhook EcoCashTransaction
 	if err := json.Unmarshal(body, &webhook); err != nil {
 		return gateways.WebhookEvent{}, fmt.Errorf("failed to parse webhook body: %w", err)
 	}
+	legacyTxnFill(&webhook, body)
 
-	if webhook.TransactionID == "" {
+	if webhook.TxID() == "" {
 		return gateways.WebhookEvent{}, fmt.Errorf("missing transactionId in webhook")
 	}
 
@@ -409,65 +539,37 @@ func (c *Client) VerifyWebhook(ctx context.Context, headers http.Header, body []
 		)
 	}
 
-	// Parse amount
-	var amountCents int64
-	if webhook.Amount != "" {
-		// Amount may be decimal string like "5.00" or "5"
-		var amountFloat float64
-		if _, err := fmt.Sscanf(webhook.Amount, "%f", &amountFloat); err == nil {
-			amountCents = int64(amountFloat * 100)
-		}
-	}
-
-	// Determine event type from status
-	status := strings.ToLower(webhook.Status)
+	state := mapEcoCashTxnState(webhook)
 	var eventType string
-	switch status {
-	case "successful", "delivered":
+	switch state {
+	case "completed":
 		eventType = "payment.completed"
-	case statePending, "initiated":
+	case statePending:
 		eventType = "payment.status_update"
-	case "failed", "rejected":
+	case "failed":
 		eventType = "payment.failed"
 	case "cancelled":
 		eventType = "payment.cancelled"
-	case "reversed":
+	case "refunded":
 		eventType = "payment.refunded"
 	default:
 		eventType = "payment.status_update"
 	}
 
 	return gateways.WebhookEvent{
-		ExternalReference: webhook.TransactionID,
-		State:             mapEcoCashStatus(webhook.Status),
-		Amount:            gateways.Money{Amount: amountCents, Currency: webhook.Currency},
-		Currency:          webhook.Currency,
+		ExternalReference: webhook.TxID(),
+		State:             state,
+		Amount:            gateways.Money{Amount: int64(webhook.PaymentAmount.TotalAmountCharged * 100), Currency: webhook.CurrencyCode},
+		Currency:          webhook.CurrencyCode,
 		EventType:         eventType,
 		Metadata: map[string]string{
-			"clientCorrelator": webhook.ClientCorrelator,
-			"status":           webhook.Status,
-			"statusMessage":    webhook.StatusMessage,
-			"endUserMSISN":     webhook.EndUserMSISN,
-			"merchantCode":     webhook.MerchantCode,
-			"timestamp":        webhook.Timestamp,
+			"clientCorrelator":     webhook.ClientCorrelator,
+			"status":               webhook.TransactionOperationStatus,
+			"statusMessage":        webhook.Message(),
+			"ecocashReference":     webhook.EcoCashReference,
+			"endUserId":            webhook.EndUserId,
+			"merchantCode":         webhook.MerchantCode,
+			"serverReferenceCode":  webhook.ServerReferenceCode,
 		},
 	}, nil
-}
-
-// mapEcoCashStatus maps EcoCash status strings to our state machine states.
-func mapEcoCashStatus(status string) string {
-	switch strings.ToLower(status) {
-	case "successful", "delivered":
-		return "completed"
-	case statePending, "initiated":
-		return statePending
-	case "failed", "rejected":
-		return "failed"
-	case "cancelled":
-		return "cancelled"
-	case "reversed":
-		return "refunded"
-	default:
-		return statePending
-	}
 }

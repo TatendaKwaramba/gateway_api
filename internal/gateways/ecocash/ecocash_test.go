@@ -70,18 +70,21 @@ func mockEcoCashServer(t *testing.T) (*httptest.Server, *Client) {
 				return
 			}
 
-			// Success response
+			// Success response — sandbox wire shape (field-verified 2026-10-21):
+			// numeric id, transactionOperationStatus, nested paymentAmount.
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(ChargeResponse{
-				TransactionID:    "PP1204433.1148.78123456",
-				ClientCorrelator: chargeReq.ClientCorrelator,
-				Status:           "Pending",
-				StatusMessage:    "Transaction Successful",
-				Currency:         chargeReq.PaymentAmount.ChargingInformation.Currency,
-				EndUserMSISN:     chargeReq.EndUserId,
-				MerchantCode:     chargeReq.MerchantCode,
-				Timestamp:        "2024-04-22T11:41:45.382",
+			json.NewEncoder(w).Encode(EcoCashTransaction{
+				ID:                         json.Number("1627627570"),
+				ClientCorrelator:           chargeReq.ClientCorrelator,
+				ReferenceCode:              chargeReq.ReferenceCode,
+				EndUserId:                  chargeReq.EndUserId,
+				TransactionOperationStatus: "PENDING SUBSCRIBER VALIDATION",
+				EcoCashResponseCode:        "PAUSED",
+				ResponseMessage:            "PENDING_VALIDATION",
+				Text:                       "Transaction is pending subscriber validation",
+				CurrencyCode:               chargeReq.PaymentAmount.ChargingInformation.Currency,
+				MerchantCode:               chargeReq.MerchantCode,
 			})
 
 		// Lookup endpoint: /{msisdn}/transactions/amount/{clientCorrelator}
@@ -92,25 +95,31 @@ func mockEcoCashServer(t *testing.T) (*httptest.Server, *Client) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 
-			// Determine status based on the correlator
-			status := "Pending"
+			// Determine outcome based on the correlator
+			txn := EcoCashTransaction{
+				ID:                         json.Number("3043"),
+				ClientCorrelator:           parts[len(parts)-1],
+				TransactionOperationStatus: "PENDING SUBSCRIBER VALIDATION",
+				EcoCashResponseCode:        "PAUSED",
+				ResponseMessage:            "PENDING_VALIDATION",
+				CurrencyCode:               "USD",
+				EndUserId:                  parts[0],
+				MerchantCode:               "986185",
+				ReferenceCode:              strings.ToUpper(parts[len(parts)-1]),
+			}
+			txn.PaymentAmount.TotalAmountCharged = 5.00
 			if strings.Contains(path, "COMPLETED") {
-				status = "Successful"
+				txn.TransactionOperationStatus = "COMPLETED"
+				txn.EcoCashResponseCode = "SUCCEEDED"
+				txn.ResponseMessage = "Process service request successfully."
+				txn.EcoCashReference = "MP261021.1536.T6422219"
 			} else if strings.Contains(path, "FAILED") {
-				status = "Failed"
+				txn.TransactionOperationStatus = "COMPLETED"
+				txn.EcoCashResponseCode = "FAILED"
+				txn.ResponseMessage = "Transaction Failed - Invalid PIN"
 			}
 
-			json.NewEncoder(w).Encode(LookupResponse{
-				TransactionID:    "PP1204433.1148.78123456",
-				ClientCorrelator: parts[len(parts)-1],
-				Status:           status,
-				StatusMessage:    "Transaction " + status,
-				Currency:         "USD",
-				EndUserMSISN:     parts[0],
-				MerchantCode:     "986185",
-				Amount:           "5.00",
-				Timestamp:        "2024-04-22T11:41:45.382",
-			})
+			json.NewEncoder(w).Encode(txn)
 
 		// Refund endpoint
 		case strings.HasSuffix(path, "/transactions/refund/") && method == http.MethodPost:
@@ -125,10 +134,12 @@ func mockEcoCashServer(t *testing.T) (*httptest.Server, *Client) {
 
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(RefundResponse{
-				Status:        "Reversed",
-				StatusMessage: "Refund processed",
-				TransactionID: refundReq.TransactionID,
+			json.NewEncoder(w).Encode(EcoCashTransaction{
+				ID:                         json.Number("3043"),
+				TransactionOperationStatus: "COMPLETED",
+				EcoCashResponseCode:        "SUCCEEDED",
+				ResponseMessage:            "Process service request successfully.",
+				TransactionLegacyID:        refundReq.TransactionID,
 			})
 
 		default:
@@ -196,8 +207,13 @@ func TestAdapter_Initiate_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "pending", result.State)
 	assert.NotEmpty(t, result.ExternalReference)
-	assert.Contains(t, result.Metadata, "clientCorrelator")
-	assert.Equal(t, "Transaction Successful", result.Metadata["statusMessage"])
+	assert.Equal(t, "1627627570", result.ExternalReference)
+	assert.Equal(t, "test-ref-001", result.Metadata["clientCorrelator"])
+	assert.Equal(
+		t,
+		"Transaction is pending subscriber validation",
+		result.Metadata["statusMessage"],
+	)
 }
 
 func TestAdapter_Initiate_RequiresPhone(t *testing.T) {
@@ -354,7 +370,7 @@ func TestClient_Charge_WithAPICredential(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	require.NotEmpty(t, body.TransactionID)
+	assert.Equal(t, "PP-CRED", body.TxID())
 	// The wire header must use the credential, not the merchant PIN.
 	require.True(t, strings.HasPrefix(gotAuth, "Basic "), "missing Basic prefix: %q", gotAuth)
 	require.Equal(t, client.basicAuthToken, strings.TrimPrefix(gotAuth, "Basic "))
@@ -379,8 +395,8 @@ func TestClient_Charge(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	assert.Equal(t, "PP1204433.1148.78123456", resp.TransactionID)
-	assert.Equal(t, "Pending", resp.Status)
+	assert.Equal(t, "1627627570", resp.TxID())
+	assert.Equal(t, "PENDING SUBSCRIBER VALIDATION", resp.TransactionOperationStatus)
 	assert.Equal(t, "test-123", resp.ClientCorrelator)
 }
 
@@ -410,7 +426,7 @@ func TestClient_Lookup(t *testing.T) {
 
 	resp, err := client.Lookup(context.Background(), "0772123456", "test-correlator")
 	require.NoError(t, err)
-	assert.Equal(t, "Pending", resp.Status)
+	assert.Equal(t, "PENDING SUBSCRIBER VALIDATION", resp.TransactionOperationStatus)
 	assert.Equal(t, "test-correlator", resp.ClientCorrelator)
 }
 
@@ -420,7 +436,9 @@ func TestClient_Lookup_Completed(t *testing.T) {
 
 	resp, err := client.Lookup(context.Background(), "0772123456", "COMPLETED-CORRELATOR")
 	require.NoError(t, err)
-	assert.Equal(t, "Successful", resp.Status)
+	assert.Equal(t, "COMPLETED", resp.TransactionOperationStatus)
+	assert.Equal(t, "SUCCEEDED", resp.EcoCashResponseCode)
+	assert.Equal(t, "MP261021.1536.T6422219", resp.EcoCashReference)
 }
 
 func TestClient_Refund(t *testing.T) {
@@ -434,8 +452,8 @@ func TestClient_Refund(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	assert.Equal(t, "Reversed", resp.Status)
-	assert.Equal(t, "PP1204433.1148.78123456", resp.TransactionID)
+	assert.Equal(t, "COMPLETED", resp.TransactionOperationStatus)
+	assert.Equal(t, "3043", resp.TxID())
 }
 
 func TestClient_VerifyWebhook(t *testing.T) {
@@ -463,7 +481,7 @@ func TestClient_VerifyWebhook(t *testing.T) {
 	assert.Equal(t, "payment.completed", event.EventType)
 	assert.Equal(t, int64(500), event.Amount.Amount)
 	assert.Equal(t, "USD", event.Currency)
-	assert.Equal(t, "0772123456", event.Metadata["endUserMSISN"])
+	assert.Equal(t, "0772123456", event.Metadata["endUserId"])
 }
 
 func TestClient_VerifyWebhook_Pending(t *testing.T) {
@@ -547,27 +565,87 @@ func TestClient_GenerateBasicAuth(t *testing.T) {
 	assert.Equal(t, expected, client.basicAuthToken)
 }
 
-func TestMapEcoCashStatus(t *testing.T) {
+func TestMapEcoCashTxnState(t *testing.T) {
 	tests := []struct {
-		input    string
+		name     string
+		txn      EcoCashTransaction
 		expected string
 	}{
-		{"Successful", "completed"},
-		{"successful", "completed"},
-		{"Delivered", "completed"},
-		{"Pending", "pending"},
-		{"Initiated", "pending"},
-		{"Failed", "failed"},
-		{"Rejected", "failed"},
-		{"Cancelled", "cancelled"},
-		{"Reversed", "refunded"},
-		{"Unknown", "pending"},
-		{"", "pending"},
+		{
+			name: "sandbox pending (field-verified)",
+			txn: EcoCashTransaction{
+				TransactionOperationStatus: "PENDING SUBSCRIBER VALIDATION",
+				EcoCashResponseCode:        "PAUSED",
+				ResponseMessage:            "PENDING_VALIDATION",
+			},
+			expected: "pending",
+		},
+		{
+			name: "sandbox completed (field-verified)",
+			txn: EcoCashTransaction{
+				TransactionOperationStatus: "COMPLETED",
+				EcoCashResponseCode:        "SUCCEEDED",
+				ResponseMessage:            "Process service request successfully.",
+				EcoCashReference:           "MP261021.1536.T6422219",
+			},
+			expected: "completed",
+		},
+		{
+			name: "failed operation code",
+			txn: EcoCashTransaction{
+				TransactionOperationStatus: "COMPLETED",
+				EcoCashResponseCode:        "FAILED",
+				ResponseMessage:            "Transaction Failed - Invalid PIN",
+			},
+			expected: "failed",
+		},
+		{
+			name: "insufficient funds",
+			txn: EcoCashTransaction{ResponseMessage: "Insufficient Balance"},
+			expected: "failed",
+		},
+		{
+			name: "invalid customer PIN",
+			txn: EcoCashTransaction{ResponseMessage: "Transaction Failed - Invalid PIN"},
+			expected: "failed",
+		},
+		{
+			name: "limit exceeded",
+			txn: EcoCashTransaction{ResponseMessage: "Transaction Limit Exceeded"},
+			expected: "failed",
+		},
+		{
+			name: "legacy successful webhook",
+			txn: EcoCashTransaction{TransactionOperationStatus: "Successful"},
+			expected: "completed",
+		},
+		{
+			name: "legacy reversed webhook",
+			txn: EcoCashTransaction{TransactionOperationStatus: "Reversed"},
+			expected: "refunded",
+		},
+		{
+			name: "legacy cancelled webhook",
+			txn: EcoCashTransaction{TransactionOperationStatus: "Cancelled"},
+			expected: "cancelled",
+		},
+		{
+			name: "completed without wallet reference or success message",
+			txn: EcoCashTransaction{
+				TransactionOperationStatus: "COMPLETED",
+			},
+			expected: "failed",
+		},
+		{
+			name: "unknown stays pending",
+			txn:  EcoCashTransaction{},
+			expected: "pending",
+		},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			assert.Equal(t, tt.expected, mapEcoCashStatus(tt.input))
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, mapEcoCashTxnState(tt.txn))
 		})
 	}
 }
@@ -756,16 +834,22 @@ func TestChargeResponse_AllFieldsParsed(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		// Real sandbox wire shape (field-verified 2026-10-21).
 		fmt.Fprintf(w, `{
-			"transactionId": "PP1204433.1148.78123456",
+			"id": 1627627570,
 			"clientCorrelator": "my-correlator",
-			"status": "Pending",
-			"statusMessage": "Transaction Successful",
-			"ecocashRef": "ECO-REF-123",
-			"currency": "USD",
-			"endUserMSISN": "0772123456",
+			"transactionOperationStatus": "PENDING SUBSCRIBER VALIDATION",
+			"ecocashResponseCode": "PAUSED",
+			"responseMessage": "PENDING_VALIDATION",
+			"text": "Transaction is pending subscriber validation",
+			"endUserId": "0772123456",
 			"merchantCode": "986185",
-			"timestamp": "2024-04-22T11:41:45.382"
+			"currencyCode": "USD",
+			"ecocashReference": "MP261021.1536.T6422219",
+			"paymentAmount": {
+				"totalAmountCharged": 0,
+				"charginginformation": {"amount": 1, "currency": "USD", "description": "probe"}
+			}
 		}`)
 	}))
 	defer server.Close()
@@ -785,15 +869,12 @@ func TestChargeResponse_AllFieldsParsed(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	assert.Equal(t, "PP1204433.1148.78123456", resp.TransactionID)
 	assert.Equal(t, "my-correlator", resp.ClientCorrelator)
-	assert.Equal(t, "Pending", resp.Status)
-	assert.Equal(t, "Transaction Successful", resp.StatusMessage)
-	assert.Equal(t, "ECO-REF-123", resp.EcoCashRef)
-	assert.Equal(t, "USD", resp.Currency)
-	assert.Equal(t, "0772123456", resp.EndUserMSISN)
+	assert.Equal(t, "PENDING SUBSCRIBER VALIDATION", resp.TransactionOperationStatus)
+	assert.Equal(t, "MP261021.1536.T6422219", resp.EcoCashReference)
+	assert.Equal(t, "USD", resp.CurrencyCode)
+	assert.Equal(t, "0772123456", resp.EndUserId)
 	assert.Equal(t, "986185", resp.MerchantCode)
-	assert.Equal(t, "2024-04-22T11:41:45.382", resp.Timestamp)
 }
 
 func TestClient_VerifyWebhook_MerchantPinMismatch(t *testing.T) {

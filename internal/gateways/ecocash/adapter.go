@@ -198,23 +198,38 @@ func (a *Adapter) Initiate(ctx context.Context, req gateways.InitiateRequest) (g
 	if correlator == "" {
 		correlator = clientCorrelator
 	}
+	externalRef := chargeResp.TxID()
+	if externalRef == "" {
+		return gateways.InitiateResult{}, fmt.Errorf(
+			"ecocash charge accepted (id %s) but response carried no transaction identifier",
+			chargeResp.ServerReferenceCode,
+		)
+	}
+	msisdn := chargeResp.EndUserId
+	if msisdn == "" {
+		msisdn = normalizeMSISDN(req.CustomerPhone)
+	}
 	a.msisdnCacheMu.Lock()
-	a.msisdnCache[chargeResp.TransactionID] = cacheEntry{
-		msisdn:     chargeResp.EndUserMSISN,
+	a.msisdnCache[externalRef] = cacheEntry{
+		msisdn:     msisdn,
 		correlator: correlator,
 	}
 	a.msisdnCacheMu.Unlock()
 
 	// Map status
-	state := mapEcoCashStatus(chargeResp.Status)
+	state := mapEcoCashTxnState(*chargeResp)
+	if state == statePending {
+		// Normal: the synchronous charge response is always pending
+		// ("PENDING SUBSCRIBER VALIDATION") and resolves via webhook/poll.
+	}
 
 	result := gateways.InitiateResult{
-		ExternalReference: chargeResp.TransactionID,
+		ExternalReference: externalRef,
 		State:             state,
 		Metadata: map[string]string{
-			"clientCorrelator": chargeResp.ClientCorrelator,
-			"statusMessage":    chargeResp.StatusMessage,
-			"timestamp":        chargeResp.Timestamp,
+			"clientCorrelator": correlator,
+			"statusMessage":    chargeResp.Message(),
+			"ecocashReference": chargeResp.EcoCashReference,
 		},
 	}
 
@@ -244,20 +259,12 @@ func (a *Adapter) Status(ctx context.Context, externalRef string) (gateways.Stat
 		return gateways.StatusResult{}, fmt.Errorf("ecocash status check failed: %w", err)
 	}
 
-	state := mapEcoCashStatus(lookupResp.Status)
-
-	var amountCents int64
-	if lookupResp.Amount != "" {
-		var amountFloat float64
-		if _, err := fmt.Sscanf(lookupResp.Amount, "%f", &amountFloat); err == nil {
-			amountCents = int64(amountFloat * 100)
-		}
-	}
+	state := mapEcoCashTxnState(*lookupResp)
 
 	return gateways.StatusResult{
 		State:    state,
-		Amount:   gateways.Money{Amount: amountCents, Currency: lookupResp.Currency},
-		Currency: lookupResp.Currency,
+		Amount:   gateways.Money{Amount: int64(lookupResp.PaymentAmount.TotalAmountCharged * 100), Currency: lookupResp.CurrencyCode},
+		Currency: lookupResp.CurrencyCode,
 	}, nil
 }
 
@@ -330,15 +337,16 @@ func (a *Adapter) Refund(ctx context.Context, externalRef string, amount gateway
 	}
 
 	// A successful refund API call means the reversal was accepted.
-	// Use the mapped status, but default to "refunded" if EcoCash returns "Successful"
-	// (which would otherwise map to "completed").
-	state := mapEcoCashStatus(refundResp.Status)
+	// The external reference stays the ORIGINAL payment id — the refund
+	// response carries its own numeric id which EcoCash uses to link the
+	// reversal, not ours to track.
+	state := mapEcoCashTxnState(*refundResp)
 	if state == "completed" {
 		state = "refunded"
 	}
 
 	return gateways.RefundResult{
-		ExternalReference: refundResp.TransactionID,
+		ExternalReference: externalRef,
 		State:             state,
 	}, nil
 }
