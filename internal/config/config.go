@@ -38,6 +38,7 @@ type Config struct {
 
 	// EcoCash direct gateway (developers.ecocash.co.zw)
 	EcoCashAPIKey         string `envconfig:"ECOCASH_API_KEY"`
+	EcoCashAPICredential  string `envconfig:"ECOCASH_API_CREDENTIAL"` // Basic-auth password paired with the API key (not the merchant PIN)
 	EcoCashMerchantCode   string `envconfig:"ECOCASH_MERCHANT_CODE"`
 	EcoCashMerchantPin    string `envconfig:"ECOCASH_MERCHANT_PIN"`
 	EcoCashMerchantNumber string `envconfig:"ECOCASH_MERCHANT_NUMBER"`

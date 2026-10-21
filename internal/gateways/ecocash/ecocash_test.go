@@ -44,13 +44,13 @@ func mockEcoCashServer(t *testing.T) (*httptest.Server, *Client) {
 			err = json.Unmarshal(body, &chargeReq)
 			require.NoError(t, err)
 
-			// Validate required fields
-			require.NotEmpty(t, chargeReq.EndUserMSISN)
-			require.NotEmpty(t, chargeReq.ChargingInformation.Amount)
-			require.NotEmpty(t, chargeReq.ChargingInformation.Currency)
+			// Validate required fields (sandbox sample shape)
+			require.NotEmpty(t, chargeReq.EndUserId)
+			require.NotEmpty(t, chargeReq.PaymentAmount.ChargingInformation.Amount)
+			require.NotEmpty(t, chargeReq.PaymentAmount.ChargingInformation.Currency)
 
 			// Simulate failure for magic phone suffix
-			if strings.HasSuffix(chargeReq.EndUserMSISN, "0004") {
+			if strings.HasSuffix(chargeReq.EndUserId, "0004") {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnprocessableEntity)
 				json.NewEncoder(w).Encode(map[string]string{
@@ -61,7 +61,7 @@ func mockEcoCashServer(t *testing.T) (*httptest.Server, *Client) {
 			}
 
 			// Simulate auth failure for magic phone suffix
-			if strings.HasSuffix(chargeReq.EndUserMSISN, "0005") {
+			if strings.HasSuffix(chargeReq.EndUserId, "0005") {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
 				json.NewEncoder(w).Encode(map[string]string{
@@ -78,8 +78,8 @@ func mockEcoCashServer(t *testing.T) (*httptest.Server, *Client) {
 				ClientCorrelator: chargeReq.ClientCorrelator,
 				Status:           "Pending",
 				StatusMessage:    "Transaction Successful",
-				Currency:         chargeReq.ChargingInformation.Currency,
-				EndUserMSISN:     chargeReq.EndUserMSISN,
+				Currency:         chargeReq.PaymentAmount.ChargingInformation.Currency,
+				EndUserMSISN:     chargeReq.EndUserId,
 				MerchantCode:     chargeReq.MerchantCode,
 				Timestamp:        "2024-04-22T11:41:45.382",
 			})
@@ -327,6 +327,39 @@ func TestAdapter_Refund_Success(t *testing.T) {
 	assert.Equal(t, "PP1204433.1148.78123456", result.ExternalReference)
 }
 
+func TestClient_Charge_WithAPICredential(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"transactionId":"PP-CRED","status":"Pending","clientCorrelator":"cred-test"}`))
+	}))
+	defer server.Close()
+
+	// The developer-portal Basic auth is base64(username:password) where the
+	// password is a dedicated API credential, NOT the merchant payload PIN.
+	cred := "sandbox-password"
+	client := NewClient("test-api-key-12345", "code", "1234", "number", "terminal", server.URL)
+	client.WithAPICredential(cred)
+	require.Equal(t, base64.StdEncoding.EncodeToString([]byte("test-api-key-12345:"+cred)), client.basicAuthToken)
+	require.NotEqual(t, base64.StdEncoding.EncodeToString([]byte("test-api-key-12345:1234")), client.basicAuthToken)
+
+	// Charge still carries the payload PIN untouched.
+	body, err := client.Charge(context.Background(), ChargeRequest{
+		ClientCorrelator: "cred-test",
+		EndUserId:        "0772123456",
+		PaymentAmount: PaymentAmount{
+			ChargingInformation: ChargingInformation{Amount: 1, Currency: "USD"},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, body.TransactionID)
+	// The wire header must use the credential, not the merchant PIN.
+	require.True(t, strings.HasPrefix(gotAuth, "Basic "), "missing Basic prefix: %q", gotAuth)
+	require.Equal(t, client.basicAuthToken, strings.TrimPrefix(gotAuth, "Basic "))
+}
+
 func TestClient_Charge(t *testing.T) {
 	server, client := mockEcoCashServer(t)
 	defer server.Close()
@@ -334,12 +367,14 @@ func TestClient_Charge(t *testing.T) {
 	resp, err := client.Charge(context.Background(), ChargeRequest{
 		ClientCorrelator: "test-123",
 		ReferenceCode:    "ref-123",
-		EndUserMSISN:     "0772123456",
+		EndUserId:        "0772123456",
 		TranType:         "MCR",
-		ChargingInformation: ChargingInformation{
-			Amount:      "5.00",
-			Currency:    "USD",
-			Description: "Test payment",
+		PaymentAmount: PaymentAmount{
+			ChargingInformation: ChargingInformation{
+				Amount:      5.00,
+				Currency:    "USD",
+				Description: "Test payment",
+			},
 		},
 	})
 
@@ -356,10 +391,12 @@ func TestClient_Charge_Defaults(t *testing.T) {
 	// Charge without merchant details — should use client defaults
 	resp, err := client.Charge(context.Background(), ChargeRequest{
 		ClientCorrelator: "test-defaults",
-		EndUserMSISN:     "0772123456",
-		ChargingInformation: ChargingInformation{
-			Amount:   "10.00",
-			Currency: "USD",
+		EndUserId:        "0772123456",
+		PaymentAmount: PaymentAmount{
+			ChargingInformation: ChargingInformation{
+				Amount:   10.00,
+				Currency: "USD",
+			},
 		},
 	})
 
@@ -663,10 +700,12 @@ func TestClient_BasicAuthHeader(t *testing.T) {
 
 	_, _ = client.Charge(context.Background(), ChargeRequest{
 		ClientCorrelator: "test",
-		EndUserMSISN:     "0772123456",
-		ChargingInformation: ChargingInformation{
-			Amount:   "1.00",
-			Currency: "USD",
+		EndUserId:        "0772123456",
+		PaymentAmount: PaymentAmount{
+			ChargingInformation: ChargingInformation{
+				Amount:   1.00,
+				Currency: "USD",
+			},
 		},
 	})
 
@@ -736,10 +775,12 @@ func TestChargeResponse_AllFieldsParsed(t *testing.T) {
 
 	resp, err := client.Charge(context.Background(), ChargeRequest{
 		ClientCorrelator: "my-correlator",
-		EndUserMSISN:     "0772123456",
-		ChargingInformation: ChargingInformation{
-			Amount:   "5.00",
-			Currency: "USD",
+		EndUserId:        "0772123456",
+		PaymentAmount: PaymentAmount{
+			ChargingInformation: ChargingInformation{
+				Amount:   5.00,
+				Currency: "USD",
+			},
 		},
 	})
 

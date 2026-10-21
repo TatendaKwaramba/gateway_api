@@ -62,6 +62,16 @@ func NewAdapterWithClient(client *Client, notifyURL, returnURL string) *Adapter 
 	}
 }
 
+// WithAPICredential overrides the Basic-auth password with the dedicated
+// developer-portal API credential (empty value keeps the legacy
+// apiKey:merchantPin auth). Returns the adapter for chaining.
+func (a *Adapter) WithAPICredential(credential string) *Adapter {
+	if credential != "" {
+		a.client.WithAPICredential(credential)
+	}
+	return a
+}
+
 // Code returns the gateway code.
 func (a *Adapter) Code() string {
 	return GatewayCode
@@ -136,9 +146,6 @@ func (a *Adapter) Initiate(ctx context.Context, req gateways.InitiateRequest) (g
 		referenceCode = clientCorrelator
 	}
 
-	// Amount as decimal string
-	amountStr := fmt.Sprintf("%.2f", req.Amount.Float64())
-
 	description := req.Metadata["description"]
 	if description == "" {
 		description = "Payment"
@@ -147,16 +154,18 @@ func (a *Adapter) Initiate(ctx context.Context, req gateways.InitiateRequest) (g
 	chargeReq := ChargeRequest{
 		ClientCorrelator: clientCorrelator,
 		ReferenceCode:    referenceCode,
-		EndUserMSISN:     normalizeMSISDN(req.CustomerPhone),
+		EndUserId:        normalizeMSISDN(req.CustomerPhone),
 		TranType:         "MCR",
 		Remarks:          description,
-		ChargingInformation: ChargingInformation{
-			Amount:      amountStr,
-			Currency:    req.Currency,
-			Description: description,
-		},
-		ChargeMetaData: ChargeMetaData{
-			Channel: "Online",
+		PaymentAmount: PaymentAmount{
+			ChargingInformation: ChargingInformation{
+				Amount:      req.Amount.Float64(),
+				Currency:    req.Currency,
+				Description: description,
+			},
+			ChargeMetaData: ChargeMetaData{
+				Channel: "WEB",
+			},
 		},
 		NotifyURL: a.notifyURL,
 	}

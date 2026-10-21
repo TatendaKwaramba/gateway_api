@@ -45,10 +45,16 @@ type Client struct {
 	merchantName      string
 	httpClient        *http.Client
 	baseURL           string
-	basicAuthToken    string // base64(apiKey + ":" + merchantPin), computed once
+	basicAuthToken    string // base64(apiKey + ":" + apiCredential), computed once
 }
 
 // NewClient creates a new EcoCash API client.
+//
+// Basic auth is base64(apiKey:apiCredential) per the EcoCash developer
+// docs (username:password). apiCredential is the separate credential
+// minted with the API key — NOT the merchant PIN, which travels in the
+// charge payload. Without WithAPICredential the legacy behaviour of
+// authing with apiKey:merchantPin is kept (older sandboxes).
 func NewClient(apiKey, merchantCode, merchantPin, merchantNumber, terminalID, baseURL string) *Client {
 	authToken := base64.StdEncoding.EncodeToString(
 		[]byte(apiKey + ":" + merchantPin),
@@ -71,6 +77,16 @@ func NewProductionClient(apiKey, merchantCode, merchantPin, merchantNumber, term
 	return NewClient(apiKey, merchantCode, merchantPin, merchantNumber, terminalID, productionBaseURL)
 }
 
+// WithAPICredential overrides the Basic-auth password with the dedicated
+// API credential (the developer-portal password paired with the API key).
+// Returns the client for chaining.
+func (c *Client) WithAPICredential(credential string) *Client {
+	c.basicAuthToken = base64.StdEncoding.EncodeToString(
+		[]byte(c.apiKey + ":" + credential),
+	)
+	return c
+}
+
 // SetHTTPClient allows injecting a custom HTTP client (useful for testing).
 func (c *Client) SetHTTPClient(client *http.Client) {
 	c.httpClient = client
@@ -89,34 +105,46 @@ func (c *Client) SetMerchantDetails(superMerchantName, merchantName string) {
 
 // ChargingInformation contains the payment amount and currency.
 type ChargingInformation struct {
-	Amount      string `json:"amount"`
-	Currency    string `json:"currency"`
-	Description string `json:"description"`
+	Amount      float64 `json:"amount"`
+	Currency    string  `json:"currency"`
+	Description string  `json:"description"`
 }
 
 // ChargeMetaData contains additional metadata for the charge.
 type ChargeMetaData struct {
-	Channel string `json:"channel"`
+	Channel              string `json:"channel"`
+	PurchaseCategoryCode string `json:"purchaseCategoryCode,omitempty"`
+	OnBeHalfOf           string `json:"onBeHalfOf,omitempty"`
+}
+
+// PaymentAmount groups the charging information and metadata exactly as the
+// EcoCash sandbox expects (note the all-lowercase "charginginformation").
+type PaymentAmount struct {
+	ChargingInformation ChargingInformation `json:"charginginformation"`
+	ChargeMetaData      ChargeMetaData      `json:"chargeMetaData"`
 }
 
 // ChargeRequest contains the parameters for initiating a C2B charge.
+// Field names/casing mirror the documented sandbox sample:
+// https://developers.ecocash.co.zw — paymentAmount.charginginformation,
+// endUserId, merchantCode/Pin/Number, countryCode, terminalID.
 type ChargeRequest struct {
-	ClientCorrelator           string              `json:"clientCorrelator"`
-	ReferenceCode              string              `json:"referenceCode"`
-	EndUserMSISN               string              `json:"endUserMSISN"`
-	TranType                   string              `json:"tranType"`
-	Remarks                    string              `json:"remarks"`
-	ChargingInformation        ChargingInformation `json:"chargingInformation"`
-	ChargeMetaData             ChargeMetaData      `json:"chargeMetaData"`
-	MerchantCode               string              `json:"merchantCode"`
-	MerchantPin                string              `json:"merchantPin"`
-	MerchantNumber             string              `json:"merchantNumber"`
-	CountryCode                string              `json:"countryCode"`
-	TerminalID                 string              `json:"terminalID"`
-	NotifyURL                  string              `json:"notifyUrl"`
-	SuperMerchantName          string              `json:"superMerchantName"`
-	MerchantName               string              `json:"merchantName"`
-	TransactionOperationStatus string              `json:"transactionOperationStatus"`
+	ClientCorrelator           string        `json:"clientCorrelator"`
+	ReferenceCode              string        `json:"referenceCode"`
+	TranType                   string        `json:"tranType"`
+	EndUserId                  string        `json:"endUserId"`
+	PaymentAmount              PaymentAmount `json:"paymentAmount"`
+	Location                   string        `json:"location,omitempty"`
+	MerchantCode               string        `json:"merchantCode"`
+	MerchantPin                string        `json:"merchantPin"`
+	MerchantNumber             string        `json:"merchantNumber"`
+	CountryCode                string        `json:"countryCode"`
+	TerminalID                 string        `json:"terminalID"`
+	NotifyURL                  string        `json:"notifyUrl,omitempty"`
+	SuperMerchantName          string        `json:"superMerchantName,omitempty"`
+	MerchantName               string        `json:"merchantName,omitempty"`
+	TransactionOperationStatus string        `json:"transactionOperationStatus,omitempty"`
+	Remarks                    string        `json:"remarks,omitempty"`
 }
 
 // ChargeResponse contains the response from an EcoCash charge request.
@@ -189,8 +217,8 @@ func (c *Client) Charge(ctx context.Context, req ChargeRequest) (*ChargeResponse
 	if req.TranType == "" {
 		req.TranType = "MCR"
 	}
-	if req.ChargeMetaData.Channel == "" {
-		req.ChargeMetaData.Channel = "Online"
+	if req.PaymentAmount.ChargeMetaData.Channel == "" {
+		req.PaymentAmount.ChargeMetaData.Channel = "WEB"
 	}
 	if req.TransactionOperationStatus == "" {
 		req.TransactionOperationStatus = "Charged"
