@@ -42,7 +42,7 @@ func (c *Client) DisconnectUser(ctx context.Context, username, nasIP string) err
 	body, _ := json.Marshal(payload)
 
 	req, err := http.NewRequestWithContext(ctx, "POST",
-		fmt.Sprintf("%s/api/internal/coa/disconnect", c.baseURL), bytes.NewReader(body))
+		fmt.Sprintf("%s/api/internal/coa/disconnect/", c.baseURL), bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("failed to build disconnect request: %w", err)
 	}
@@ -80,7 +80,7 @@ func (c *Client) ApplyPlanSpeeds(ctx context.Context, customerID, planID int64, 
 	body, _ := json.Marshal(payload)
 
 	req, err := http.NewRequestWithContext(ctx, "POST",
-		fmt.Sprintf("%s/api/internal/coa/apply-plan", c.baseURL), bytes.NewReader(body))
+		fmt.Sprintf("%s/api/internal/coa/apply-plan/", c.baseURL), bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("failed to build apply-plan request: %w", err)
 	}

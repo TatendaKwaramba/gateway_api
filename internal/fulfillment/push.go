@@ -127,11 +127,15 @@ func (s *Service) sendPushForPhone(ctx context.Context, transactionID int64, pho
 // insertNotificationAttempt writes a pending notification_attempts audit row
 // and returns its ID
 func (s *Service) insertNotificationAttempt(ctx context.Context, transactionID int64, recipient, channel, body string) (int64, error) {
+	var txnRef interface{}
+	if transactionID > 0 {
+		txnRef = transactionID
+	}
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO notification_attempts (
 			transaction_id, recipient, channel, body, status, retry_count, attempted_at, updated_at
 		) VALUES (?, ?, ?, ?, 'pending', 0, NOW(), NOW())
-	`, transactionID, recipient, channel, body)
+	`, txnRef, recipient, channel, body)
 	if err != nil {
 		return 0, fmt.Errorf("failed to log notification attempt: %w", err)
 	}
