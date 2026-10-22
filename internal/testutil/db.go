@@ -207,6 +207,21 @@ CREATE TABLE IF NOT EXISTS services_subscriptionplan (
     is_active TINYINT(1) DEFAULT 1
 );
 
+CREATE TABLE IF NOT EXISTS subscriptions_subscriptionadjustment (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    subscription_id BIGINT NOT NULL,
+    old_plan_id BIGINT NOT NULL,
+    new_plan_id BIGINT NOT NULL,
+    proration_credit DECIMAL(10,2) DEFAULT 0,
+    proration_charge DECIMAL(10,2) DEFAULT 0,
+    net_amount DECIMAL(10,2) DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'pending',
+    payment_transaction_id BIGINT NULL,
+    reason TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME NULL
+);
+
 CREATE TABLE IF NOT EXISTS billing_billingplan (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(100),
@@ -275,11 +290,11 @@ CREATE TABLE IF NOT EXISTS payments_paymenttransaction (
     external_reference VARCHAR(255),
     gateway_response JSON DEFAULT ('{}'),
     idempotency_key VARCHAR(255) UNIQUE,
-    fulfillment_kind VARCHAR(20) DEFAULT 'voucher',
+    fulfillment_kind VARCHAR(40) DEFAULT 'voucher',
     organization_id BIGINT NULL,
     fee_amount DECIMAL(10,2) NULL,
     net_amount DECIMAL(10,2) NULL,
-    voucher_pin VARCHAR(16),
+    voucher_pin VARCHAR(40),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     completed_at DATETIME,

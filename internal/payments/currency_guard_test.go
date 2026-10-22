@@ -61,6 +61,10 @@ func (stubFulfillment) Fulfill(ctx context.Context, req fulfillment.FulfillReque
 
 func (stubFulfillment) Rollback(ctx context.Context, voucherPIN string) error { return nil }
 
+func (stubFulfillment) AdjustSubscription(ctx context.Context, subID, newPlanID int64, req fulfillment.FulfillRequest) (*fulfillment.FulfillResult, error) {
+	return &fulfillment.FulfillResult{Success: true, VoucherPIN: "adj:1:2"}, nil
+}
+
 var _ FulfillmentService = stubFulfillment{}
 
 // TestValidateGatewayCurrencyAdapterGuard locks the layer-2 initiate guard:

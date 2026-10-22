@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -32,6 +33,10 @@ const EventTypePaymentStatusUpdate = "payment.status_update"
 type FulfillmentService interface {
 	Fulfill(ctx context.Context, req fulfillment.FulfillRequest) (*fulfillment.FulfillResult, error)
 	Rollback(ctx context.Context, voucherPIN string) error
+	// AdjustSubscription applies a plan change without a payment (free
+	// adjustment, recomputed net must be 0). Shared core with the paid
+	// subscription_adjustment fulfillment path.
+	AdjustSubscription(ctx context.Context, subID, newPlanID int64, req fulfillment.FulfillRequest) (*fulfillment.FulfillResult, error)
 }
 
 // Service handles payment operations
@@ -125,9 +130,11 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 	}
 
 	if req.PlanID != nil {
-		if err := s.validatePlanAmount(ctx, *req.PlanID, req.Amount, req.Currency, req.FulfillmentKind); err != nil {
+		if err := s.validatePlanAmount(ctx, *req.PlanID, req.Amount, req.Currency, req.FulfillmentKind, req.Metadata); err != nil {
 			return nil, err
 		}
+	} else if req.FulfillmentKind == "subscription_adjustment" {
+		return nil, fmt.Errorf("subscription_adjustment requires plan_id (the new plan)")
 	}
 
 	// Resolve gateway
@@ -907,16 +914,18 @@ func (s *Service) findTxnByWebhookCorrelator(ctx context.Context, gatewayCode st
 	if endUser == "" {
 		return 0, false
 	}
+	// E.164 formats drop the leading zero (+263779070941 vs 0779070941), so
+	// match on the last 9 digits — the mobile-app-wide suffix bridge.
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT t.id
 		FROM payments_paymenttransaction t
 		JOIN payments_paymentgateway g ON g.id = t.gateway_id
 		WHERE g.gateway_code = ?
 		  AND t.state IN ('initiated', 'pending')
-		  AND t.customer_phone LIKE CONCAT('%', ?)
+		  AND RIGHT(t.customer_phone, 9) = ?
 		ORDER BY t.id DESC
 		LIMIT 2
-	`, gatewayCode, endUser)
+	`, gatewayCode, phoneSuffix(endUser))
 	if err != nil {
 		return 0, false
 	}
@@ -1150,6 +1159,7 @@ func (s *Service) triggerFulfillment(ctx context.Context, transactionID int64) {
 
 	var nasIP, nasID, referralCode string
 	var durationDays int
+	var subscriptionID int64
 	if gatewayResponse.Valid && gatewayResponse.String != "" {
 		var meta map[string]interface{}
 		if json.Unmarshal([]byte(gatewayResponse.String), &meta) == nil {
@@ -1167,6 +1177,14 @@ func (s *Service) triggerFulfillment(ctx context.Context, transactionID int64) {
 					durationDays = d
 				}
 			}
+			switch v := meta["subscription_id"].(type) {
+			case string:
+				if id, err := strconv.ParseInt(v, 10, 64); err == nil {
+					subscriptionID = id
+				}
+			case float64:
+				subscriptionID = int64(v)
+			}
 		}
 	}
 
@@ -1176,6 +1194,7 @@ func (s *Service) triggerFulfillment(ctx context.Context, transactionID int64) {
 		Amount:           amountCents,
 		Currency:         currency,
 		DurationDays:     durationDays,
+		SubscriptionID:   subscriptionID,
 		CustomerPhone:    customerPhone.String,
 		CustomerEmail:    customerEmail.String,
 		FulfillmentKind:  fulfillmentKind,
@@ -1235,6 +1254,12 @@ func (s *Service) triggerFulfillment(ctx context.Context, transactionID int64) {
 		slog.Int64("transaction_id", transactionID),
 		slog.String("voucher_pin", result.VoucherPIN),
 	)
+
+	// Plan adjustments: push the new plan's speeds to any live sessions via
+	// CoA (best-effort — RADIUS artifacts already cover the next login).
+	if fulfillmentKind == "subscription_adjustment" {
+		s.applyAdjustmentCoA(ctx, fr.SubscriptionID, fr.PlanID)
+	}
 
 	// Notify Django of payment completion (triggers commission processing)
 	go s.notifyDjangoCompletion(ctx, transactionID, referralCode)
@@ -1436,13 +1461,13 @@ func (s *Service) calculateFee(ctx context.Context, gatewayCode string, amount f
 	return 0
 }
 
-func (s *Service) validatePlanAmount(ctx context.Context, planID, amount int64, currency string, fulfillmentKind string) error {
+func (s *Service) validatePlanAmount(ctx context.Context, planID, amount int64, currency string, fulfillmentKind string, metadata map[string]string) error {
 	if fulfillmentKind == "subscription" {
 		var price int64
 		var planCurrency string
 		err := s.db.QueryRowContext(ctx, `
-			SELECT price_minor, COALESCE(currency, ?) FROM billing_billingplan
-			WHERE id = ? AND is_active = 1
+			SELECT price_minor, COALESCE(currency, ?) FROM services_subscriptionplan
+			WHERE id = ? AND is_active = TRUE
 		`, s.defaultCurrency, planID).Scan(&price, &planCurrency)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("subscription plan not found: %d", planID)
@@ -1457,6 +1482,21 @@ func (s *Service) validatePlanAmount(ctx context.Context, planID, amount int64, 
 			return fmt.Errorf("currency %s does not match subscription plan currency %s", currency, planCurrency)
 		}
 		return nil
+	}
+	if fulfillmentKind == "subscription_adjustment" {
+		// The paid amount is the prorated net, not the full plan price, so a
+		// simple price equality check cannot apply. Require the subscription
+		// id in metadata and that the new plan lives on
+		// services_subscriptionplan (the FK target) — the tamper guard
+		// (paid >= server-recomputed net) runs at fulfillment, the only
+		// place that can execute the change.
+		if sid := metadataSubscriptionID(metadata); sid > 0 {
+			if _, err := s.fetchSubscriptionPlan(ctx, planID, true); err != nil {
+				return err
+			}
+			return nil
+		}
+		return fmt.Errorf("subscription_adjustment requires subscription_id in metadata")
 	}
 	// Default: validate against hotspot tariff plan
 	var price int64
@@ -1479,6 +1519,20 @@ func (s *Service) validatePlanAmount(ctx context.Context, planID, amount int64, 
 		return fmt.Errorf("currency %s does not match plan currency %s", currency, planCurrency)
 	}
 	return nil
+}
+
+// metadataSubscriptionID extracts the subscription id from initiate metadata
+// (string values only — the JSON endpoint layer passes strings).
+func metadataSubscriptionID(metadata map[string]string) int64 {
+	if metadata == nil {
+		return 0
+	}
+	if v, ok := metadata["subscription_id"]; ok {
+		if id, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+			return id
+		}
+	}
+	return 0
 }
 
 // ListPlans returns all active tariff plans ordered by price
@@ -1540,19 +1594,18 @@ func (s *Service) ListPlans(ctx context.Context) ([]*Plan, error) {
 // ListSubscriptionPlans returns all active billing plans ordered by price
 func (s *Service) ListSubscriptionPlans(ctx context.Context) ([]*Plan, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT bp.id, bp.name,
-			bp.price_minor, COALESCE(bp.currency, ?),
-			COALESCE(bc.duration_days, 30),
-			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.download_speed'), 0),
-			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.upload_speed'), 0),
-			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.max_sessions'), 1),
-			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.fup_data_quota_mb'), 0),
-			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.fup_download_speed'), 0),
-			COALESCE(JSON_EXTRACT(bp.policy_summary, '$.fup_upload_speed'), 0)
-		FROM billing_billingplan bp
-		LEFT JOIN services_billingcycle bc ON bc.id = bp.billing_cycle_id
-		WHERE bp.is_active = 1
-		ORDER BY bp.price_minor ASC
+		SELECT sp.id, sp.name,
+		       sp.price_minor, COALESCE(sp.currency, ?),
+		       COALESCE(NULLIF(sp.billing_period_days, 0), 30),
+		       COALESCE(sp.download_speed, 0),
+		       COALESCE(sp.upload_speed, 0),
+		       COALESCE(sp.max_sessions, 1),
+		       COALESCE(sp.fup_data_quota_mb, 0),
+		       COALESCE(sp.fup_download_speed, 0),
+		       COALESCE(sp.fup_upload_speed, 0)
+		FROM services_subscriptionplan sp
+		WHERE sp.is_active = TRUE
+		ORDER BY sp.price_minor ASC
 	`, s.defaultCurrency)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query subscription plans: %w", err)
@@ -2055,25 +2108,32 @@ type SubscriptionInfo struct {
 	EndDate       string `json:"end_date"`
 	AutoRenew     bool   `json:"auto_renew"`
 	DaysRemaining int    `json:"days_remaining"`
+	// OwnerPhone is the subscription owner's contact — the customer app
+	// echoes it for the free-adjustment apply endpoint's owner check.
+	OwnerPhone string `json:"customer_phone,omitempty"`
 }
 
 // GetSubscription returns the current subscription details for a given ID.
+// Plan data comes from services_subscriptionplan — the FK target of
+// subscriptions_subscription.plan_id (billing_billingplan ids are an
+// unrelated sequence and must not be joined here).
 func (s *Service) GetSubscription(ctx context.Context, subscriptionID int64) (*SubscriptionInfo, error) {
 	var info SubscriptionInfo
 	var endDate sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
-		SELECT s.id, s.customer_id, s.plan_id, bp.name, bp.price_minor, bp.currency,
-		       COALESCE(JSON_EXTRACT(bp.policy_summary, '$.download_speed'), 0),
-		       COALESCE(JSON_EXTRACT(bp.policy_summary, '$.upload_speed'), 0),
+		SELECT s.id, s.customer_id, s.plan_id, sp.name, sp.price_minor,
+		       COALESCE(sp.currency, ?),
+		       sp.download_speed, sp.upload_speed,
 		       s.status, s.start_date, s.end_date,
-		       s.auto_renew
+		       s.auto_renew, COALESCE(c.customer_phone, '')
 		FROM subscriptions_subscription s
-		JOIN billing_billingplan bp ON bp.id = s.plan_id
+		JOIN services_subscriptionplan sp ON sp.id = s.plan_id
+		JOIN authentication_customer c ON c.id = s.customer_id
 		WHERE s.id = ?
-	`, subscriptionID).Scan(
+	`, s.defaultCurrency, subscriptionID).Scan(
 		&info.ID, &info.CustomerID, &info.PlanID, &info.PlanName, &info.PriceMinor,
 		&info.Currency, &info.DownloadSpeed, &info.UploadSpeed, &info.Status,
-		&info.StartDate, &endDate, &info.AutoRenew,
+		&info.StartDate, &endDate, &info.AutoRenew, &info.OwnerPhone,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2115,6 +2175,10 @@ type PlanInfo struct {
 }
 
 // CalculateAdjustment computes proration for a subscription plan change.
+// Plan data comes from services_subscriptionplan — the FK target of
+// subscriptions_subscription.plan_id. The proration math lives in
+// fulfillment.ComputeProration so the fulfillment-side tamper guard always
+// recomputes exactly what was quoted.
 func (s *Service) CalculateAdjustment(ctx context.Context, subscriptionID, newPlanID int64) (*AdjustmentQuote, error) {
 	// Fetch current subscription
 	var currentPlanID int64
@@ -2135,60 +2199,169 @@ func (s *Service) CalculateAdjustment(ctx context.Context, subscriptionID, newPl
 		return nil, fmt.Errorf("subscription is %s, only active subscriptions can be adjusted", status)
 	}
 
-	// Fetch old plan
-	var oldPlan PlanInfo
-	err = s.db.QueryRowContext(ctx, `
-		SELECT id, name, price_minor, currency,
-		       COALESCE(JSON_EXTRACT(policy_summary, '$.download_speed'), 0),
-		       COALESCE(JSON_EXTRACT(policy_summary, '$.upload_speed'), 0)
-		FROM billing_billingplan WHERE id = ?
-	`, currentPlanID).Scan(&oldPlan.ID, &oldPlan.Name, &oldPlan.PriceMinor, &oldPlan.Currency, &oldPlan.DownloadSpeed, &oldPlan.UploadSpeed)
+	oldPlan, err := s.fetchSubscriptionPlan(ctx, currentPlanID, false)
 	if err != nil {
-		return nil, fmt.Errorf("query old plan: %w", err)
+		return nil, err
+	}
+	newPlan, err := s.fetchSubscriptionPlan(ctx, newPlanID, true)
+	if err != nil {
+		return nil, err
+	}
+	if newPlan.Currency != "" && oldPlan.Currency != "" && newPlan.Currency != oldPlan.Currency {
+		return nil, fmt.Errorf("plan currency mismatch: current %s vs new %s", oldPlan.Currency, newPlan.Currency)
 	}
 
-	// Fetch new plan
-	var newPlan PlanInfo
-	err = s.db.QueryRowContext(ctx, `
-		SELECT id, name, price_minor, currency,
-		       COALESCE(JSON_EXTRACT(policy_summary, '$.download_speed'), 0),
-		       COALESCE(JSON_EXTRACT(policy_summary, '$.upload_speed'), 0)
-		FROM billing_billingplan WHERE id = ? AND is_active = TRUE
-	`, newPlanID).Scan(&newPlan.ID, &newPlan.Name, &newPlan.PriceMinor, &newPlan.Currency, &newPlan.DownloadSpeed, &newPlan.UploadSpeed)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("new plan %d not found or inactive", newPlanID)
-		}
-		return nil, fmt.Errorf("query new plan: %w", err)
-	}
-
-	// Calculate proration
 	billingDays := int(endDate.Sub(startDate).Hours() / 24)
-	if billingDays <= 0 {
-		billingDays = 30
-	}
 	daysRemaining := int(time.Until(endDate).Hours() / 24)
-	if daysRemaining < 0 {
-		daysRemaining = 0
-	}
-
-	credit := float64(oldPlan.PriceMinor) * float64(daysRemaining) / float64(billingDays)
-	charge := float64(newPlan.PriceMinor) * float64(daysRemaining) / float64(billingDays)
-	net := charge - credit
-	if net < 0 {
-		net = 0 // No refund, just credit toward new plan
-	}
+	credit, charge, net := fulfillment.ComputeProration(
+		oldPlan.PriceMinor, newPlan.PriceMinor, billingDays, daysRemaining,
+	)
 
 	return &AdjustmentQuote{
 		SubscriptionID:  subscriptionID,
-		OldPlan:         oldPlan,
-		NewPlan:         newPlan,
+		OldPlan:         *oldPlan,
+		NewPlan:         *newPlan,
 		ProrationCredit: credit,
 		ProrationCharge: charge,
 		NetAmount:       net,
 		DaysRemaining:   daysRemaining,
 		BillingDays:     billingDays,
 	}, nil
+}
+
+// fetchSubscriptionPlan loads one plan from services_subscriptionplan. When
+// requireActive is set, inactive plans are reported as not found (the new
+// plan must be sellable; the old plan is always readable).
+func (s *Service) fetchSubscriptionPlan(ctx context.Context, planID int64, requireActive bool) (*PlanInfo, error) {
+	query := `
+		SELECT id, name, price_minor, COALESCE(currency, ''),
+		       download_speed, upload_speed, billing_period_days
+		FROM services_subscriptionplan WHERE id = ?`
+	if requireActive {
+		query += " AND is_active = TRUE"
+	}
+	var p PlanInfo
+	var billingDays sql.NullInt64
+	err := s.db.QueryRowContext(ctx, query, planID).Scan(
+		&p.ID, &p.Name, &p.PriceMinor, &p.Currency, &p.DownloadSpeed,
+		&p.UploadSpeed, &billingDays,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("subscription plan %d not found", planID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query subscription plan %d: %w", planID, err)
+	}
+	return &p, nil
+}
+
+// ApplyFreeAdjustment applies a zero-net plan change without a payment row.
+// The quote is recomputed server-side; a nonzero net is rejected (the caller
+// must pay through the normal adjustment checkout instead).
+func (s *Service) ApplyFreeAdjustment(ctx context.Context, subscriptionID, newPlanID int64, customerPhone string) (*AdjustmentQuote, error) {
+	quote, err := s.CalculateAdjustment(ctx, subscriptionID, newPlanID)
+	if err != nil {
+		return nil, err
+	}
+	if net := int64(math.Round(quote.NetAmount)); net > 0 {
+		return nil, fmt.Errorf("adjustment requires payment of %d", net)
+	}
+	if err := s.verifySubscriptionOwnerPhone(ctx, subscriptionID, customerPhone); err != nil {
+		return nil, err
+	}
+
+	req := fulfillment.FulfillRequest{
+		CustomerPhone:  customerPhone,
+		FulfillmentKind: "subscription_adjustment",
+	}
+	if _, err := s.fulfillmentService.AdjustSubscription(ctx, subscriptionID, newPlanID, req); err != nil {
+		return nil, err
+	}
+
+	s.applyAdjustmentCoA(ctx, subscriptionID, newPlanID)
+	return quote, nil
+}
+
+// verifySubscriptionOwnerPhone ensures the free-apply caller controls the
+// subscription owner's contact (suffix-9 bridge covers local vs E.164).
+func (s *Service) verifySubscriptionOwnerPhone(ctx context.Context, subscriptionID int64, customerPhone string) error {
+	var ownerPhone sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT c.customer_phone
+		FROM subscriptions_subscription s
+		JOIN authentication_customer c ON c.id = s.customer_id
+		WHERE s.id = ?
+	`, subscriptionID).Scan(&ownerPhone)
+	if err != nil {
+		return fmt.Errorf("subscription %d owner lookup failed", subscriptionID)
+	}
+	phone := normalizePhoneDigits(customerPhone)
+	owner := normalizePhoneDigits(ownerPhone.String)
+	if phone == "" || owner == "" || phone != owner && phoneSuffix(phone) != phoneSuffix(owner) {
+		return fmt.Errorf("contact does not match the subscription owner")
+	}
+	return nil
+}
+
+// normalizePhoneDigits reduces a phone to digits (canonical compare key).
+func normalizePhoneDigits(s string) string {
+	var b []byte
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b = append(b, byte(r))
+		}
+	}
+	return string(b)
+}
+
+// phoneSuffix returns the last 9 digits of a digit-run ("" when shorter) —
+// same mobile-app-wide convention as the fulfillment buyer resolution.
+func phoneSuffix(s string) string {
+	if len(s) > 9 {
+		return s[len(s)-9:]
+	}
+	return s
+}
+
+// applyAdjustmentCoA pushes the new plan's speeds to any live sessions via
+// the flash-api internal apply-plan endpoint. Best-effort: the RADIUS
+// artifacts rewritten by the fulfillment path already cover the next login,
+// so a CoA failure must never fail an already-committed adjustment.
+func (s *Service) applyAdjustmentCoA(ctx context.Context, subscriptionID, planID int64) {
+	if s.djangoClient == nil {
+		return
+	}
+	if subscriptionID <= 0 || planID <= 0 {
+		return
+	}
+	var customerID int64
+	var dl, ul int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT s.customer_id, COALESCE(sp.download_speed, 0), COALESCE(sp.upload_speed, 0)
+		FROM subscriptions_subscription s
+		JOIN services_subscriptionplan sp ON sp.id = s.plan_id
+		WHERE s.id = ?
+	`, subscriptionID).Scan(&customerID, &dl, &ul)
+	if err != nil {
+		slog.Error("adjustment CoA: subscription/plan lookup failed",
+			slog.Int64("subscription_id", subscriptionID),
+			slog.Any("error", err),
+		)
+		return
+	}
+	if err := s.djangoClient.ApplyPlanSpeeds(ctx, customerID, planID, dl, ul); err != nil {
+		metrics.RecordFulfillmentFailure("subscription_adjustment", "coa_push_failed")
+		slog.Error("adjustment CoA: apply-plan push failed (next login still applies)",
+			slog.Int64("subscription_id", subscriptionID),
+			slog.Int64("plan_id", planID),
+			slog.Any("error", err),
+		)
+		return
+	}
+	slog.Info("adjustment CoA: apply-plan pushed",
+		slog.Int64("subscription_id", subscriptionID),
+		slog.Int64("plan_id", planID),
+	)
 }
 
 // Database exposes the underlying DB handle for identity/profile enrichments

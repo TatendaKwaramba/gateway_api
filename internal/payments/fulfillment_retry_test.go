@@ -23,6 +23,10 @@ func (f *failingFulfillment) Fulfill(ctx context.Context, req fulfillment.Fulfil
 	return nil, errors.New("fulfillment: simulated outage")
 }
 
+func (f *failingFulfillment) AdjustSubscription(ctx context.Context, subID, newPlanID int64, req fulfillment.FulfillRequest) (*fulfillment.FulfillResult, error) {
+	return nil, errors.New("fulfillment: simulated outage")
+}
+
 func (f *failingFulfillment) Rollback(ctx context.Context, voucherPIN string) error {
 	return nil
 }

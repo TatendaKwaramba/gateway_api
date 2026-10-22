@@ -43,6 +43,7 @@ type FulfillRequest struct {
 	Amount           int64 // minor currency units
 	Currency         string
 	PlanID           int64
+	SubscriptionID   int64
 	DurationDays     int
 	CustomerPhone    string
 	CustomerEmail    string
@@ -104,6 +105,8 @@ func (s *Service) Fulfill(ctx context.Context, req FulfillRequest) (*FulfillResu
 		return s.fulfillVoucher(ctx, req)
 	case "subscription":
 		return s.fulfillSubscription(ctx, req)
+	case "subscription_adjustment":
+		return s.fulfillSubscriptionAdjustment(ctx, req)
 	case "topup":
 		return s.fulfillTopup(ctx, req)
 	default:

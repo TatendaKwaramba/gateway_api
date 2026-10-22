@@ -62,6 +62,44 @@ func (c *Client) DisconnectUser(ctx context.Context, username, nasIP string) err
 	return nil
 }
 
+// ApplyPlanSpeeds asks Django to push the plan's speeds to the customer's
+// live sessions via CoA (subscription plan adjustment). Best-effort by
+// contract: the caller treats failure as logged-and-ignored since RADIUS
+// artifacts already apply the new plan at next login.
+func (c *Client) ApplyPlanSpeeds(ctx context.Context, customerID, planID int64, downloadKbps, uploadKbps int) error {
+	if c.apiKey == "" {
+		return fmt.Errorf("django internal api key not configured")
+	}
+
+	payload := map[string]interface{}{
+		"customer_id":   customerID,
+		"plan_id":       planID,
+		"download_kbps": downloadKbps,
+		"upload_kbps":   uploadKbps,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/api/internal/coa/apply-plan", c.baseURL), bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to build apply-plan request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Internal-API-Key", c.apiKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("apply-plan request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("apply-plan request returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // DisconnectUserByActiveSessions queries radacct for active sessions by username
 // and issues CoA disconnect for each NAS IP found.
 func (c *Client) DisconnectUserByActiveSessions(ctx context.Context, username string) error {

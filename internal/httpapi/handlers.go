@@ -754,6 +754,50 @@ type adjustSubscriptionRequest struct {
 	NewPlanID int64 `json:"new_plan_id"`
 }
 
+// applyAdjustmentRequest is the body for the free-adjustment apply endpoint.
+// CustomerPhone must match the subscription owner's contact.
+type applyAdjustmentRequest struct {
+	NewPlanID     int64  `json:"new_plan_id"`
+	CustomerPhone string `json:"customer_phone"`
+}
+
+// applyAdjustment applies a zero-net plan change (no payment row). The
+// server recomputes the proration quote; a nonzero net is rejected — that
+// caller must pay through the normal adjustment checkout.
+func (r *Router) applyAdjustment(w http.ResponseWriter, req *http.Request) {
+	subIDStr := chi.URLParam(req, "subscription_id")
+	subscriptionID, err := strconv.ParseInt(subIDStr, 10, 64)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "invalid subscription_id")
+		return
+	}
+
+	var body applyAdjustmentRequest
+	if err := parseJSON(req, &body); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if body.NewPlanID <= 0 {
+		respondError(w, http.StatusBadRequest, "new_plan_id is required")
+		return
+	}
+	if strings.TrimSpace(body.CustomerPhone) == "" {
+		respondError(w, http.StatusBadRequest, "customer_phone is required")
+		return
+	}
+
+	quote, err := r.paymentService.ApplyFreeAdjustment(req.Context(), subscriptionID, body.NewPlanID, body.CustomerPhone)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"applied": true,
+		"quote":   quote,
+	})
+}
+
 // adjustSubscription calculates proration and initiates a payment for the difference.
 func (r *Router) adjustSubscription(w http.ResponseWriter, req *http.Request) {
 	subIDStr := chi.URLParam(req, "subscription_id")
