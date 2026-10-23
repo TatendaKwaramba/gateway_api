@@ -43,7 +43,7 @@ type Config struct {
 	EcoCashMerchantPin    string `envconfig:"ECOCASH_MERCHANT_PIN"`
 	EcoCashMerchantNumber string `envconfig:"ECOCASH_MERCHANT_NUMBER"`
 	EcoCashTerminalID     string `envconfig:"ECOCASH_TERMINAL_ID"`
-	EcoCashMerchantName   string `envconfig:"ECOCASH_MERCHANT_NAME" default:"AmaniConnect"`
+	EcoCashMerchantName   string `envconfig:"ECOCASH_MERCHANT_NAME" default:"Betta Technologies"`
 	EcoCashLocation       string `envconfig:"ECOCASH_LOCATION" default:"Harare"`
 	EcoCashBaseURL        string `envconfig:"ECOCASH_BASE_URL" default:"https://developers.ecocash.co.zw/sandbox"`
 	EcoCashNotifyURL      string `envconfig:"ECOCASH_NOTIFY_URL"`
@@ -71,7 +71,7 @@ type Config struct {
 	ExpoPushEnabled bool   `envconfig:"EXPO_PUSH_ENABLED" default:"false"`
 
 	// Branding — user-visible strings (SMS/email/push texts)
-	BrandName string `envconfig:"BRAND_NAME" default:"AmaniConnect"`
+	BrandName string `envconfig:"BRAND_NAME" default:"Betta Technologies"`
 	// Organization attributed to app sign-up customers (0 = auto: the only
 	// organization when the deployment has exactly one, else unattributed)
 	DefaultOrgID int64 `envconfig:"DEFAULT_ORG_ID" default:"0"`

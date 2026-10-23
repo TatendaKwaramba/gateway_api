@@ -29,7 +29,7 @@ func TestSendPostsToMailgunAPI(t *testing.T) {
 	provider := NewProvider(
 		"test-api-key",
 		"sandbox9e6af233cc634281b5f9a7ab0285b8e0.mailgun.org",
-		"AmaniConnect <postmaster@sandbox9e6af233cc634281b5f9a7ab0285b8e0.mailgun.org>",
+		"Betta Technologies <postmaster@sandbox9e6af233cc634281b5f9a7ab0285b8e0.mailgun.org>",
 		server.URL,
 	)
 	err := provider.Send(context.Background(), notify.Message{

@@ -94,7 +94,7 @@ func (e OtpEmail) RenderHTML() string {
 
 func (e OtpEmail) brandName() string {
 	if e.Brand == "" {
-		return "AmaniConnect"
+		return "Betta Technologies"
 	}
 	return e.Brand
 }

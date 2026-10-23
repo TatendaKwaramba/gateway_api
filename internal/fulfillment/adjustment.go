@@ -246,7 +246,7 @@ func (s *Service) subscriptionAdjustmentCore(ctx context.Context, subID, newPlan
 		return nil, fmt.Errorf("fulfillment: clear radreply: %w", err)
 	}
 	radreplyAttrs := []struct{ attr, value string }{
-		{"Reply-Message", "Cached by AmaniConnect"},
+		{"Reply-Message", "Cached by Betta Technologies"},
 		{"Mikrotik-Rate-Limit", rateLimit},
 		{"Mikrotik-Recv-Limit", "1000000000000"},
 		{"Mikrotik-Xmit-Limit", "1000000000000"},

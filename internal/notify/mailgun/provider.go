@@ -56,7 +56,7 @@ func (p *Provider) Send(ctx context.Context, msg notify.Message) error {
 		return errors.New("mailgun: recipient is required")
 	}
 	if msg.Subject == "" {
-		msg.Subject = "AmaniConnect notification"
+		msg.Subject = "Betta Technologies notification"
 	}
 
 	form := url.Values{}
