@@ -19,6 +19,7 @@ import (
 	"github.com/freeradius/payments-api/internal/fulfillment"
 	"github.com/freeradius/payments-api/internal/gateways"
 	"github.com/freeradius/payments-api/internal/metrics"
+	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 )
 
@@ -143,6 +144,16 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		return nil, fmt.Errorf("gateway not found: %s", req.GatewayCode)
 	}
 
+	// IdempotencyKey must never be ''. The column is NULLable with a UNIQUE
+	// index, so many NULLs are legal but exactly ONE '' is allowed — a single
+	// empty-key row would poison every subsequent keyless insert with
+	// "...Duplicate entry '' for key 'payments_paymenttransaction.idempotency_key'".
+	// Default keyless requests to a fresh UUID (the gateway adapters already
+	// tolerate clients without a key).
+	if req.IdempotencyKey == "" {
+		req.IdempotencyKey = uuid.NewString()
+	}
+
 	// Check idempotency
 	reqJSON, _ := json.Marshal(req)
 	requestHash := ComputeRequestHash(reqJSON)
@@ -219,82 +230,102 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 
 	// F3.8: When gateway_id is provided, insert directly without gateway_code join
 	if req.GatewayID != nil {
-		result, err := s.db.ExecContext(ctx, `
-			INSERT INTO payments_paymenttransaction (
-				transaction_id, gateway_id, payment_method_id, amount, currency,
-				tariff_plan_id,
-				state, status, customer_id, customer_email, customer_phone,
-				idempotency_key, fulfillment_kind, gateway_response,
-				organization_id, fee_amount, net_amount,
-				created_at, updated_at
+		insert := func(idemKey string) (sql.Result, error) {
+			return s.db.ExecContext(ctx, `
+				INSERT INTO payments_paymenttransaction (
+					transaction_id, gateway_id, payment_method_id, amount, currency,
+					tariff_plan_id,
+					state, status, customer_id, customer_email, customer_phone,
+					idempotency_key, fulfillment_kind, gateway_response,
+					organization_id, fee_amount, net_amount,
+					created_at, updated_at
+				)
+				SELECT
+					?, ?, pm.id, ?, ?, ?,
+					'initiated', 'initiated', ?, ?, ?,
+					?, ?, ?,
+					?, ?, ?,
+					NOW(), NOW()
+				FROM payments_paymentmethod pm
+				WHERE pm.gateway_id = ? AND pm.method_code = ?
+			`,
+				transactionIDStr,
+				*req.GatewayID,
+				float64(req.Amount)/100.0,
+				req.Currency,
+				planID,
+				req.CustomerID,
+				req.CustomerEmail,
+				req.CustomerPhone,
+				idemKey,
+				fulfillmentKind,
+				gatewayResponseJSON,
+				orgID,
+				feeAmount,
+				netAmount,
+				*req.GatewayID,
+				req.MethodCode,
 			)
-			SELECT 
-				?, ?, pm.id, ?, ?, ?,
-				'initiated', 'initiated', ?, ?, ?,
-				?, ?, ?,
-				?, ?, ?,
-				NOW(), NOW()
-			FROM payments_paymentmethod pm
-			WHERE pm.gateway_id = ? AND pm.method_code = ?
-		`,
-			transactionIDStr,
-			*req.GatewayID,
-			float64(req.Amount)/100.0,
-			req.Currency,
-			planID,
-			req.CustomerID,
-			req.CustomerEmail,
-			req.CustomerPhone,
-			req.IdempotencyKey,
-			fulfillmentKind,
-			gatewayResponseJSON,
-			orgID,
-			feeAmount,
-			netAmount,
-			*req.GatewayID,
-			req.MethodCode,
-		)
+		}
+		result, err := insert(req.IdempotencyKey)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create transaction: %w", err)
+			// A stale '' (or racing) row on the unique idempotency_key index:
+			// retry once with a fresh key instead of failing checkout outright.
+			if isDuplicateIdempotencyKey(err) {
+				req.IdempotencyKey = uuid.NewString()
+				result, err = insert(req.IdempotencyKey)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("failed to create transaction: %w", err)
+			}
 		}
 		transactionID, _ = result.LastInsertId()
 	} else {
-		result, err := s.db.ExecContext(ctx, `
-			INSERT INTO payments_paymenttransaction (
-				transaction_id, gateway_id, payment_method_id, amount, currency,
-				tariff_plan_id,
-				state, status, customer_id, customer_email, customer_phone,
-				idempotency_key, fulfillment_kind, gateway_response,
-				organization_id, fee_amount, net_amount,
-				created_at, updated_at
+		insert := func(idemKey string) (sql.Result, error) {
+			return s.db.ExecContext(ctx, `
+				INSERT INTO payments_paymenttransaction (
+					transaction_id, gateway_id, payment_method_id, amount, currency,
+					tariff_plan_id,
+					state, status, customer_id, customer_email, customer_phone,
+					idempotency_key, fulfillment_kind, gateway_response,
+					organization_id, fee_amount, net_amount,
+					created_at, updated_at
+				)
+				SELECT
+					?, g.id, pm.id, ?, ?, ?,
+					'initiated', 'initiated', ?, ?, ?,
+					?, ?, ?,
+					g.organization_id, ?, ?,
+					NOW(), NOW()
+				FROM payments_paymentgateway g
+				LEFT JOIN payments_paymentmethod pm ON pm.gateway_id = g.id AND pm.method_code = ?
+				WHERE g.gateway_code = ?
+			`,
+				transactionIDStr,
+				float64(req.Amount)/100.0,
+				req.Currency,
+				planID,
+				req.CustomerID,
+				req.CustomerEmail,
+				req.CustomerPhone,
+				idemKey,
+				fulfillmentKind,
+				gatewayResponseJSON,
+				feeAmount,
+				netAmount,
+				req.MethodCode,
+				req.GatewayCode,
 			)
-			SELECT 
-				?, g.id, pm.id, ?, ?, ?,
-				'initiated', 'initiated', ?, ?, ?,
-				?, ?, ?,
-				g.organization_id, ?, ?,
-				NOW(), NOW()
-			FROM payments_paymentgateway g
-			LEFT JOIN payments_paymentmethod pm ON pm.gateway_id = g.id AND pm.method_code = ?
-			WHERE g.gateway_code = ?
-		`,
-			transactionIDStr,
-			float64(req.Amount)/100.0,
-			req.Currency,
-			planID,
-			req.CustomerID,
-			req.CustomerEmail,
-			req.CustomerPhone,
-			req.IdempotencyKey,
-			fulfillmentKind,
-			gatewayResponseJSON,
-			feeAmount,
-			netAmount,
-			req.MethodCode,
-			req.GatewayCode,
-		)
+		}
+		result, err := insert(req.IdempotencyKey)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create transaction: %w", err)
+			if isDuplicateIdempotencyKey(err) {
+				req.IdempotencyKey = uuid.NewString()
+				result, err = insert(req.IdempotencyKey)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("failed to create transaction: %w", err)
+			}
 		}
 		transactionID, _ = result.LastInsertId()
 	}
@@ -2321,6 +2352,16 @@ func phoneSuffix(s string) string {
 		return s[len(s)-9:]
 	}
 	return s
+}
+
+// isDuplicateIdempotencyKey reports whether err is a MySQL 1062 raised
+// specifically against the transaction's unique idempotency_key index (other
+// 1062s — e.g. transaction_id colliding — are real faults and must surface).
+func isDuplicateIdempotencyKey(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) &&
+		mysqlErr.Number == 1062 &&
+		strings.Contains(mysqlErr.Message, "idempotency_key")
 }
 
 // applyAdjustmentCoA pushes the new plan's speeds to any live sessions via

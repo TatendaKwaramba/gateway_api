@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	_ "github.com/go-sql-driver/mysql" // registers the MySQL driver with database/sql
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
@@ -15,7 +17,16 @@ import (
 // SetupTestDB spins up an ephemeral MySQL container via dockertest, creates the
 // required schema, seeds a mock gateway and a tariff plan, and returns the
 // database handle plus a cleanup function.
+//
+// Set TESTUTIL_MYSQL_DSN to reuse an already-running MySQL server instead
+// (rootless hosts where the test process cannot reach the container runtime).
+// The DSN should point at the server (any default database is ignored): a
+// dedicated scratch database is created for the run and dropped at cleanup,
+// so real schemas are never touched.
 func SetupTestDB() (*sql.DB, func(), error) {
+	if serverDSN := os.Getenv("TESTUTIL_MYSQL_DSN"); serverDSN != "" {
+		return setupExternalDB(serverDSN)
+	}
 	pool, err := dockertest.NewPool("")
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not construct pool: %w", err)
@@ -77,6 +88,86 @@ func SetupTestDB() (*sql.DB, func(), error) {
 	}
 
 	return db, cleanup, nil
+}
+
+// setupExternalDB creates a scratch database on an already-running MySQL
+// server (TESTUTIL_MYSQL_DSN) and applies the same schema + fixtures.
+func setupExternalDB(serverDSN string) (*sql.DB, func(), error) {
+	parse := func(d string) *mysql.Config {
+		cfg, err := mysql.ParseDSN(d)
+		if err != nil {
+			log.Fatalf("TESTUTIL_MYSQL_DSN invalid: %v", err)
+		}
+		return cfg
+	}
+
+	server, err := sql.Open("mysql", serverDSN)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not open external MySQL: %w", err)
+	}
+
+	// Exponential backoff-retry because the server might not accept connections yet
+	var db *sql.DB
+	dbName := fmt.Sprintf("payments_test_%d", time.Now().UnixNano())
+	if err := retryLoop(func() error {
+		if err := server.Ping(); err != nil {
+			return err
+		}
+		if _, err := server.Exec(
+			"CREATE DATABASE IF NOT EXISTS `" + dbName + "` DEFAULT CHARACTER SET utf8mb4",
+		); err != nil {
+			return fmt.Errorf("could not create scratch database %s: %w", dbName, err)
+		}
+		cfg := parse(serverDSN)
+		cfg.DBName = dbName
+		db, err = sql.Open("mysql", cfg.FormatDSN())
+		if err != nil {
+			return err
+		}
+		return db.Ping()
+	}); err != nil {
+		server.Close()
+		return nil, nil, fmt.Errorf("could not connect to external MySQL: %w", err)
+	}
+
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	if err := createSchema(db); err != nil {
+		db.Close()
+		server.Close()
+		return nil, nil, fmt.Errorf("schema creation failed: %w", err)
+	}
+
+	if err := seedFixtures(db); err != nil {
+		db.Close()
+		server.Close()
+		return nil, nil, fmt.Errorf("fixture seeding failed: %w", err)
+	}
+
+	cleanup := func() {
+		db.Close()
+		server.Exec("DROP DATABASE IF EXISTS `" + dbName + "`")
+		server.Close()
+	}
+
+	return db, cleanup, nil
+}
+
+// retryLoop retries fn with 2s backoff for up to ~90s (dockertest.Retry is
+// bound to a pool handle; the external path needs its own retry).
+func retryLoop(fn func() error) error {
+	var lastErr error
+	for i := 0; i < 45; i++ {
+		if err := fn(); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return lastErr
 }
 
 func createSchema(db *sql.DB) error {
